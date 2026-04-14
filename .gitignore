@@ -48,5 +48,8 @@ vcpkg/
 
 .vs/
 
+# Local/raw datasets
+data/raw/us101/us101_raw.csv
+
 # Ignore local cache used by e.g. clangd
 .cache/
