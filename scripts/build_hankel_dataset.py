@@ -16,8 +16,8 @@ def main() -> None:
         "tx_power_dbm",
         "beacon_interval_s",
         "prr_150m",
-        "cbr",
         "pir_s",
+        "cbr",
     ]
     missing = [c for c in keep if c not in df.columns]
     if missing:

@@ -1,3 +1,4 @@
+import argparse
 import re
 from pathlib import Path
 
@@ -6,13 +7,61 @@ import numpy as np
 import pandas as pd
 
 
-KPI_PATH = Path("data/output/kpi_timeseries_run01.csv")
-TX_PATH = Path("data/output/kpi_timeseries_run01_tx_packet_log.csv")
-RX_PATH = Path("data/output/kpi_timeseries_run01_rx_packet_log.csv")
+OUTPUT_DIR = Path("data/output")
 
 AWARENESS_RANGE_M = 150.0
 KPI_WINDOW_S = 1.0
 WARMUP_S = 5.0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate KPI CSV output against raw TX/RX packet logs."
+    )
+    parser.add_argument(
+        "kpi_csv",
+        nargs="?",
+        type=Path,
+        help="KPI CSV to validate. Defaults to the newest KPI CSV in data/output.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=float,
+        default=WARMUP_S,
+        help=f"Warm-up cutoff in seconds. Default: {WARMUP_S}",
+    )
+    parser.add_argument(
+        "--window",
+        type=float,
+        default=KPI_WINDOW_S,
+        help=f"PRR validation window in seconds. Default: {KPI_WINDOW_S}",
+    )
+    return parser.parse_args()
+
+
+def newest_kpi_csv() -> Path:
+    candidates = [
+        path
+        for path in OUTPUT_DIR.glob("kpi*.csv")
+        if not path.name.endswith(("_tx_packet_log.csv", "_rx_packet_log.csv"))
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"No KPI CSV files found in {OUTPUT_DIR}")
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def log_paths(kpi_path: Path) -> tuple[Path, Path]:
+    stem = kpi_path.with_suffix("")
+    return (
+        Path(f"{stem}_tx_packet_log.csv"),
+        Path(f"{stem}_rx_packet_log.csv"),
+    )
+
+
+def require_columns(df: pd.DataFrame, path: Path, columns: list[str]) -> None:
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {', '.join(missing)}")
 
 
 def eligible_bin_columns(tx: pd.DataFrame) -> list[tuple[str, float, float]]:
@@ -30,13 +79,38 @@ def unique_rx_count(rx: pd.DataFrame) -> int:
 
 
 def main() -> None:
-    kpi = pd.read_csv(KPI_PATH)
-    tx = pd.read_csv(TX_PATH)
-    rx = pd.read_csv(RX_PATH)
+    args = parse_args()
+    kpi_path = args.kpi_csv or newest_kpi_csv()
+    tx_path, rx_path = log_paths(kpi_path)
 
-    kpi_eval = kpi[kpi["time_s"] >= WARMUP_S].copy()
-    tx_eval = tx[tx["time_s"] >= WARMUP_S].copy()
-    rx_eval = rx[rx["time_s"] >= WARMUP_S].copy()
+    for path in (kpi_path, tx_path, rx_path):
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+    kpi = pd.read_csv(kpi_path)
+    tx = pd.read_csv(tx_path)
+    rx = pd.read_csv(rx_path)
+
+    require_columns(
+        kpi, kpi_path, ["time_s", "prr_150m", "pir_s", "beacon_interval_s", "cbr"]
+    )
+    require_columns(tx, tx_path, ["time_s", "eligible_rx_count_150m"])
+    require_columns(
+        rx,
+        rx_path,
+        ["time_s", "tx_node_id", "rx_node_id", "seq", "distance_m", "pir_s"],
+    )
+
+    kpi_eval = kpi[kpi["time_s"] >= args.warmup].copy()
+    tx_eval = tx[tx["time_s"] >= args.warmup].copy()
+    rx_eval = rx[rx["time_s"] >= args.warmup].copy()
+
+    if kpi_eval.empty:
+        last_time = kpi["time_s"].max() if not kpi.empty else float("nan")
+        raise ValueError(
+            f"No KPI samples remain after warm-up cutoff {args.warmup:.1f} s "
+            f"for {kpi_path}. Last KPI sample time is {last_time:.6g} s."
+        )
 
     # =========================
     # 1. GLOBAL PRR VALIDATION
@@ -46,19 +120,26 @@ def main() -> None:
     prr_raw = numerator / denominator if denominator else 0.0
 
     print("\n===== PRR VALIDATION =====")
-    print(f"Warm-up cutoff       : {WARMUP_S:.1f} s")
+    print(f"KPI CSV             : {kpi_path}")
+    print(f"TX log              : {tx_path}")
+    print(f"RX log              : {rx_path}")
+    print(f"Warm-up cutoff       : {args.warmup:.1f} s")
     print(f"PRR from raw logs    : {prr_raw:.6f}")
     print(f"Mean PRR KPI samples : {kpi_eval['prr_150m'].mean():.6f}")
 
     # =========================
     # 2. TIME-WINDOW PRR VALIDATION
     # =========================
-    time_bins = np.arange(kpi_eval["time_s"].min(), kpi_eval["time_s"].max(), KPI_WINDOW_S)
+    time_bins = np.arange(
+        kpi_eval["time_s"].min(),
+        kpi_eval["time_s"].max() + args.window,
+        args.window,
+    )
     prr_time = []
     time_centers = []
 
     for t1 in time_bins:
-        t0 = t1 - KPI_WINDOW_S
+        t0 = t1 - args.window
         tx_w = tx[(tx["time_s"] >= t0) & (tx["time_s"] <= t1)]
         rx_w = rx[(rx["time_s"] >= t0) & (rx["time_s"] <= t1)]
 
