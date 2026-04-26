@@ -1,4 +1,5 @@
 import json
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +19,7 @@ TARGET_DT = 0.1  # 100 msv2x_env
 MIN_TRACK_DURATION = 20.0  # seconds
 MAX_ABS_SPEED_MPS = 60.0
 MAX_POSITION_JUMP_M = 20.0
-MAX_VEHICLES = 100  # start small, increase later
+MAX_VEHICLES = 100  # default cap; override with --max-vehicles
 
 # TIME WINDOW (VERY IMPORTANT)
 TIME_START = 100.0
@@ -72,7 +73,37 @@ def interpolate_track(df_track):
 # ==============================
 # MAIN
 # ==============================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Preprocess NGSIM US-101 tracks for ns-3 V2X runs.")
+    parser.add_argument("--raw-path", type=Path, default=RAW_PATH, help="Input raw NGSIM CSV.")
+    parser.add_argument("--out-path", type=Path, default=OUT_PATH, help="Output processed mobility CSV.")
+    parser.add_argument("--cfg-path", type=Path, default=CFG_PATH, help="Output preprocessing config JSON.")
+    parser.add_argument("--max-vehicles", type=int, default=MAX_VEHICLES, help="Maximum valid tracks to keep.")
+    parser.add_argument("--time-start", type=float, default=TIME_START, help="Start of normalized time window [s].")
+    parser.add_argument("--time-end", type=float, default=TIME_END, help="End of normalized time window [s].")
+    parser.add_argument(
+        "--min-track-duration",
+        type=float,
+        default=MIN_TRACK_DURATION,
+        help="Minimum vehicle track duration to keep [s].",
+    )
+    parser.add_argument(
+        "--lanes",
+        type=str,
+        default=",".join(str(lane) for lane in sorted(MAINLINE_LANES)),
+        help="Comma-separated lane IDs to keep.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    if args.max_vehicles <= 0:
+        raise ValueError("--max-vehicles must be positive")
+    lanes = {int(lane.strip()) for lane in args.lanes.split(",") if lane.strip()}
+    if not lanes:
+        raise ValueError("--lanes must include at least one lane ID")
+
     print("Loading raw NGSIM data...")
 
     # ------------------------------
@@ -86,7 +117,7 @@ def main():
         "Lane_ID": "lane_id",
     }
 
-    df = pd.read_csv(RAW_PATH, usecols=list(rename_map), low_memory=False)
+    df = pd.read_csv(args.raw_path, usecols=list(rename_map), low_memory=False)
     df = df.rename(columns=rename_map)
 
     required = ["vehicle_id", "global_time_ms", "x_ft", "y_ft", "lane_id"]
@@ -115,7 +146,7 @@ def main():
 
     print("Converted values:")
     print(df.loc[bad_mask, required].head(20).to_string())
-# ------------------------------
+# ------
 
     df = df.dropna(subset=required).copy()
     dropped_rows = original_rows - len(df)
@@ -139,21 +170,12 @@ def main():
     # ------------------------------
     # Time window filtering
     # ------------------------------
-    df = df[(df["time_s"] >= TIME_START) & (df["time_s"] <= TIME_END)].copy()
+    df = df[(df["time_s"] >= args.time_start) & (df["time_s"] <= args.time_end)].copy()
 
     # ------------------------------
     # Lane filtering (mainline only)
     # ------------------------------
-    df = df[df["lane_id"].isin(MAINLINE_LANES)].copy()
-
-    # ------------------------------
-    # Limit number of vehicles
-    # ------------------------------
-    vehicle_ids = df["vehicle_id"].unique()
-    selected_ids = vehicle_ids[:MAX_VEHICLES]
-    df = df[df["vehicle_id"].isin(selected_ids)]
-
-    print(f"Selected vehicles: {len(selected_ids)}")
+    df = df[df["lane_id"].isin(lanes)].copy()
 
     # ------------------------------
     # Process tracks
@@ -161,11 +183,16 @@ def main():
     processed_tracks = []
     kept = []
 
-    for vid, g in df.groupby("vehicle_id"):
+    candidate_ids = df["vehicle_id"].drop_duplicates().to_numpy()
+    print(f"Candidate vehicles after time/lane filters: {len(candidate_ids)}")
+
+    grouped = {vid: g for vid, g in df.groupby("vehicle_id")}
+    for vid in candidate_ids:
+        g = grouped[vid]
         g = g.sort_values("time_s").drop_duplicates("time_s")
 
         duration = g["time_s"].iloc[-1] - g["time_s"].iloc[0]
-        if duration < MIN_TRACK_DURATION:
+        if duration < args.min_track_duration:
             continue
 
         track = interpolate_track(g)
@@ -185,9 +212,16 @@ def main():
 
         processed_tracks.append(track)
         kept.append(vid)
+        if len(kept) >= args.max_vehicles:
+            break
 
     if not processed_tracks:
         raise RuntimeError("No valid tracks after filtering.")
+    if len(kept) < args.max_vehicles:
+        raise RuntimeError(
+            f"Requested {args.max_vehicles} vehicles, but only {len(kept)} valid tracks "
+            "remained after filtering. Relax filters or use a larger raw data window."
+        )
 
     # ------------------------------
     # Merge all tracks
@@ -198,25 +232,31 @@ def main():
     # ------------------------------
     # Save output
     # ------------------------------
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(OUT_PATH, index=False)
+    args.out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(args.out_path, index=False)
 
     # ------------------------------
     # Save config (for paper reproducibility)
     # ------------------------------
+    lane_note = "All requested lanes" if lanes != MAINLINE_LANES else "Mainline only"
     cfg = {
         "dataset": "NGSIM US-101",
-        "time_window": [TIME_START, TIME_END],
+        "raw_path": str(args.raw_path),
+        "mobility_csv": str(args.out_path),
+        "time_window": [args.time_start, args.time_end],
         "sample_time": TARGET_DT,
+        "min_track_duration_s": args.min_track_duration,
         "vehicles_kept": len(set(kept)),
-        "lane_filter": sorted(MAINLINE_LANES),
-        "notes": "Mainline only, resampled to 0.1s, smoothed, filtered",
+        "lane_filter": sorted(lanes),
+        "notes": f"{lane_note}, resampled to 0.1s, smoothed, filtered",
     }
 
-    CFG_PATH.write_text(json.dumps(cfg, indent=2))
+    args.cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    args.cfg_path.write_text(json.dumps(cfg, indent=2))
 
     print("====================================")
-    print(f"Saved: {OUT_PATH}")
+    print(f"Saved: {args.out_path}")
+    print(f"Config: {args.cfg_path}")
     print(f"Vehicles kept: {len(set(kept))}")
     print("====================================")
 

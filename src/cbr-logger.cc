@@ -4,6 +4,8 @@
 #include "ns3/simulator.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <map>
 
 using namespace ns3;
 
@@ -18,12 +20,37 @@ CbrLogger::Setup(double windowS, double stepS, const std::string& filename)
     {
         NS_FATAL_ERROR("Cannot open CBR output CSV: " << filename);
     }
-    m_out << "time_s,cbr\n";
+    m_out << "time_s,cbr,sensing_exclusion_ratio\n";
+}
+
+void
+CbrLogger::SetEvaluationWindow(double startS, double endS)
+{
+    m_evalStartS = startS;
+    m_evalEndS = endS;
+}
+
+void
+CbrLogger::SetNodeEvaluationFilter(std::function<bool(uint32_t, double)> filter)
+{
+    m_nodeEvaluationFilter = filter;
+}
+
+void
+CbrLogger::SetEvaluatedNodeIds(const std::vector<uint32_t>& nodeIds)
+{
+    m_evaluatedNodeIds.clear();
+    m_evaluatedNodeIds.insert(nodeIds.begin(), nodeIds.end());
 }
 
 void
 CbrLogger::RecordObservation(double timeS, bool busy)
 {
+    if (!IsInsideEvaluationWindow(timeS))
+    {
+        return;
+    }
+
     Obs o;
     o.time = timeS;
     o.busy = busy;
@@ -35,6 +62,11 @@ CbrLogger::RecordObservation(double timeS, bool busy)
 void
 CbrLogger::RecordResourceObservation(double timeS, uint32_t busyResources, uint32_t totalResources)
 {
+    if (!IsInsideEvaluationWindow(timeS))
+    {
+        return;
+    }
+
     if (totalResources == 0)
     {
         return;
@@ -61,6 +93,11 @@ CbrLogger::RecordSensingAlgorithm(std::string context,
     (void)transmitHistory;
 
     const double now = Simulator::Now().GetSeconds();
+    if (!ShouldRecordContext(context, now))
+    {
+        return;
+    }
+
     const uint32_t totalResources = report.m_initialCandidateResourcesSize;
     if (totalResources == 0)
     {
@@ -76,12 +113,17 @@ CbrLogger::RecordSensingAlgorithm(std::string context,
 void
 CbrLogger::RecordChannelOccupied(std::string context, Time duration)
 {
+    const double now = Simulator::Now().GetSeconds();
+    if (!ShouldRecordContext(context, now))
+    {
+        return;
+    }
+
     if (duration.IsZero() || duration.IsNegative())
     {
         return;
     }
 
-    const double now = Simulator::Now().GetSeconds();
     BusyInterval interval;
     interval.startS = now;
     interval.endS = now + duration.GetSeconds();
@@ -179,31 +221,126 @@ CbrLogger::ComputeBusyFractionForContext(const std::deque<BusyInterval>& interva
 double
 CbrLogger::ComputeChannelOccupiedCbr(double now) const
 {
-    if (m_busyIntervalsByContext.empty())
+    std::map<uint32_t, std::pair<double, uint32_t>> busyFractionByNode;
+    for (const auto& kv : m_busyIntervalsByContext)
+    {
+        uint32_t nodeId = 0;
+        if (!TryParseNodeId(kv.first, nodeId))
+        {
+            continue;
+        }
+
+        if (m_nodeEvaluationFilter && !m_nodeEvaluationFilter(nodeId, now))
+        {
+            continue;
+        }
+
+        auto& aggregate = busyFractionByNode[nodeId];
+        aggregate.first += ComputeBusyFractionForContext(kv.second, now);
+        aggregate.second++;
+    }
+
+    double cbrSum = 0.0;
+    for (const auto& kv : busyFractionByNode)
+    {
+        if (kv.second.second > 0)
+        {
+            cbrSum += kv.second.first / static_cast<double>(kv.second.second);
+        }
+    }
+
+    if (!m_evaluatedNodeIds.empty())
+    {
+        uint32_t denominator = 0;
+        for (const auto nodeId : m_evaluatedNodeIds)
+        {
+            if (!m_nodeEvaluationFilter || m_nodeEvaluationFilter(nodeId, now))
+            {
+                denominator++;
+            }
+        }
+        return (denominator > 0) ? cbrSum / static_cast<double>(denominator) : 0.0;
+    }
+
+    if (busyFractionByNode.empty())
     {
         return 0.0;
     }
 
-    double cbrSum = 0.0;
-    for (const auto& kv : m_busyIntervalsByContext)
-    {
-        cbrSum += ComputeBusyFractionForContext(kv.second, now);
-    }
-    return cbrSum / static_cast<double>(m_busyIntervalsByContext.size());
+    return cbrSum / static_cast<double>(busyFractionByNode.size());
 }
 
 double
 CbrLogger::ComputeCbr(double now)
 {
     Prune(now);
+    return std::min(1.0, std::max(0.0, ComputeChannelOccupiedCbr(now)));
+}
 
-    const double sensingCbr = ComputeSensingCbr(now);
-    if (sensingCbr >= 0.0)
+double
+CbrLogger::ComputeSensingExclusionRatio(double now)
+{
+    Prune(now);
+
+    const double sensingRatio = ComputeSensingCbr(now);
+    return (sensingRatio >= 0.0) ? std::min(1.0, std::max(0.0, sensingRatio)) : 0.0;
+}
+
+bool
+CbrLogger::IsInsideEvaluationWindow(double timeS) const
+{
+    return timeS >= m_evalStartS && (m_evalEndS < 0.0 || timeS <= m_evalEndS);
+}
+
+bool
+CbrLogger::TryParseNodeId(const std::string& context, uint32_t& nodeId) const
+{
+    const std::string marker = "/NodeList/";
+    const std::size_t start = context.find(marker);
+    if (start == std::string::npos)
     {
-        return std::min(1.0, std::max(0.0, sensingCbr));
+        return false;
     }
 
-    return std::min(1.0, std::max(0.0, ComputeChannelOccupiedCbr(now)));
+    const std::size_t idStart = start + marker.size();
+    const std::size_t idEnd = context.find('/', idStart);
+    const std::string idText = context.substr(idStart, idEnd - idStart);
+    if (idText.empty())
+    {
+        return false;
+    }
+
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(idText.c_str(), &end, 10);
+    if (end == idText.c_str() || *end != '\0')
+    {
+        return false;
+    }
+
+    nodeId = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool
+CbrLogger::ShouldRecordContext(const std::string& context, double timeS) const
+{
+    if (!IsInsideEvaluationWindow(timeS))
+    {
+        return false;
+    }
+
+    if (!m_nodeEvaluationFilter)
+    {
+        return true;
+    }
+
+    uint32_t nodeId = 0;
+    if (!TryParseNodeId(context, nodeId))
+    {
+        return false;
+    }
+
+    return m_nodeEvaluationFilter(nodeId, timeS);
 }
 
 double
@@ -241,9 +378,13 @@ CbrLogger::Sample()
 {
     const double now = Simulator::Now().GetSeconds();
     const double cbr = ComputeCbr(now);
+    const double sensingExclusionRatio = ComputeSensingExclusionRatio(now);
 
-    m_out << now << "," << cbr << "\n";
-    m_out.flush();
+    if (IsInsideEvaluationWindow(now))
+    {
+        m_out << now << "," << cbr << "," << sensingExclusionRatio << "\n";
+        m_out.flush();
+    }
 
     Simulator::Schedule(Seconds(m_step), &CbrLogger::Sample, this);
 }

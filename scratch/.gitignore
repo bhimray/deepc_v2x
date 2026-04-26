@@ -5,4 +5,5 @@
 !nested-subdir/
 !subdir/
 !scratch-simulator.cc
+!nr_v2x_ngsim_deepc.cc
 !CMakeLists.txt

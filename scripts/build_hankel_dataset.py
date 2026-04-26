@@ -15,9 +15,14 @@ def main() -> None:
         "time_s",
         "tx_power_dbm",
         "beacon_interval_s",
+        "active_vehicle_count_core",
+        "density_veh_per_km_core",
+        "mean_neighbors_150m",
+        "mean_neighbors_300m",
         "prr_150m",
         "pir_s",
         "cbr",
+        "sensing_exclusion_ratio",
     ]
     missing = [c for c in keep if c not in df.columns]
     if missing:
