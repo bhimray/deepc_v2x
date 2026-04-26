@@ -9,6 +9,7 @@
 #include "ns3/network-module.h"
 #include "ns3/nr-module.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/tag.h"
 #include "ns3/CAM.h"
 #include "ns3/uper_decoder.h"
 #include "ns3/uper_encoder.h"
@@ -59,7 +60,7 @@ struct TxEvent
 {
     double timeS;
     uint32_t txNodeId;
-    uint32_t seq;
+    uint64_t seq;
     Vector posTx;
     uint32_t eligibleRxCount;
     std::vector<uint32_t> eligibleRxCountsByBin;
@@ -71,13 +72,77 @@ struct RxEvent
     double timeS;
     uint32_t txNodeId;
     uint32_t rxNodeId;
-    uint32_t seq;
+    uint64_t seq;
     Vector posTx;
     Vector posRx;
     double distanceAtTxM;
     double distanceAtRxM;
     double pirS;
     double delayS;
+};
+
+class KpiPacketTag : public Tag
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::KpiPacketTag")
+                                .SetParent<Tag>()
+                                .SetGroupName("Applications")
+                                .AddConstructor<KpiPacketTag>();
+        return tid;
+    }
+
+    TypeId GetInstanceTypeId() const override
+    {
+        return GetTypeId();
+    }
+
+    uint32_t GetSerializedSize() const override
+    {
+        return 16;
+    }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU64(m_sequence);
+        i.WriteU64(static_cast<uint64_t>(m_txTimeNs));
+    }
+
+    void Deserialize(TagBuffer i) override
+    {
+        m_sequence = i.ReadU64();
+        m_txTimeNs = static_cast<int64_t>(i.ReadU64());
+    }
+
+    void Print(std::ostream& os) const override
+    {
+        os << "sequence=" << m_sequence << ",txTimeNs=" << m_txTimeNs;
+    }
+
+    void SetSequence(uint64_t sequence)
+    {
+        m_sequence = sequence;
+    }
+
+    uint64_t GetSequence() const
+    {
+        return m_sequence;
+    }
+
+    void SetTxTimeNs(int64_t txTimeNs)
+    {
+        m_txTimeNs = txTimeNs;
+    }
+
+    int64_t GetTxTimeNs() const
+    {
+        return m_txTimeNs;
+    }
+
+  private:
+    uint64_t m_sequence = 0;
+    int64_t m_txTimeNs = 0;
 };
 
 static std::map<uint32_t, std::vector<MobilityRow>> g_mobilityByVehicle;
@@ -132,18 +197,6 @@ static uint32_t
 GenerationDeltaTimeMs(Time now)
 {
     return static_cast<uint32_t>(now.GetMilliSeconds() % 65536);
-}
-
-static double
-ComputeCamDelayS(uint32_t generationDeltaTimeMs, Time rxTime)
-{
-    const int64_t rxMs = rxTime.GetMilliSeconds() % 65536;
-    int64_t delayMs = rxMs - static_cast<int64_t>(generationDeltaTimeMs);
-    if (delayMs < 0)
-    {
-        delayMs += 65536;
-    }
-    return static_cast<double>(delayMs) / 1000.0;
 }
 
 static bool
@@ -437,7 +490,7 @@ class KpiLogger : public Object
         m_currentTb = tbS;
     }
 
-    void LogTx(uint32_t txNodeId, uint32_t seq, Time tTx, const Vector& posTx)
+    void LogTx(uint32_t txNodeId, uint64_t seq, Time tTx, const Vector& posTx)
     {
         const double timeS = tTx.GetSeconds();
         if (!IsInsideEvaluationWindow(timeS) || !IsInsideCore(posTx))
@@ -509,7 +562,7 @@ class KpiLogger : public Object
 
     void LogRx(uint32_t txNodeId,
            uint32_t rxNodeId,
-           uint32_t seq,
+           uint64_t seq,
            Time tRx,
            const Vector& posTx,
            const Vector& posRx,
@@ -609,14 +662,14 @@ class KpiLogger : public Object
         const double now = Simulator::Now().GetSeconds();
 
         uint64_t denom = 0;
-        std::set<std::tuple<uint32_t, uint32_t>> activeTxKeys;
+        std::set<std::tuple<uint32_t, uint64_t>> activeTxKeys;
         for (const auto& tx : m_txEvents)
         {
             denom += tx.eligibleRxCount;
             activeTxKeys.insert(std::make_tuple(tx.txNodeId, tx.seq));
         }
 
-        std::set<std::tuple<uint32_t, uint32_t, uint32_t>> uniqueRxTriples;
+        std::set<std::tuple<uint32_t, uint32_t, uint64_t>> uniqueRxTriples;
         for (const auto& rx : m_rxEvents)
         {
             if (activeTxKeys.find(std::make_tuple(rx.txNodeId, rx.seq)) != activeTxKeys.end() &&
@@ -748,7 +801,7 @@ class KpiLogger : public Object
     {
         const double now = Simulator::Now().GetSeconds();
         const double cutoff = now - m_kpiWindowS;
-        std::set<std::tuple<uint32_t, uint32_t>> activeTxKeys;
+        std::set<std::tuple<uint32_t, uint64_t>> activeTxKeys;
 
         while (!m_txEvents.empty() && m_txEvents.front().timeS < cutoff)
         {
@@ -818,7 +871,7 @@ class KpiLogger : public Object
                IsInsideCoreRegion(GetCoreCoordinate(position, m_coreAxis), m_coreMin, m_coreMax);
     }
 
-    const TxEvent* FindTxEvent(uint32_t txNodeId, uint32_t seq) const
+    const TxEvent* FindTxEvent(uint32_t txNodeId, uint64_t seq) const
     {
         for (auto it = m_txEvents.rbegin(); it != m_txEvents.rend(); ++it)
         {
@@ -853,7 +906,7 @@ class KpiLogger : public Object
 
     std::deque<TxEvent> m_txEvents;
     std::deque<RxEvent> m_rxEvents;
-    std::set<std::tuple<uint32_t, uint32_t, uint32_t>> m_loggedRxTriples;
+    std::set<std::tuple<uint32_t, uint32_t, uint64_t>> m_loggedRxTriples;
     std::map<std::pair<uint32_t, uint32_t>, double> m_lastRxTimePerPair;
 
     std::ofstream m_out;
@@ -959,8 +1012,9 @@ class CamApp : public Application
         }
 
         Vector pos = m_node->GetObject<MobilityModel>()->GetPosition();
-        const uint32_t camId = GenerationDeltaTimeMs(Simulator::Now());
-        const std::string encodedCam = BuildEncodedCam(pos, camId);
+        const uint64_t kpiSeq = m_nextKpiSequence++;
+        const uint32_t generationDeltaTimeMs = GenerationDeltaTimeMs(Simulator::Now());
+        const std::string encodedCam = BuildEncodedCam(pos, generationDeltaTimeMs);
         if (encodedCam.empty())
         {
             NS_FATAL_ERROR("Failed to encode CAM on node " << m_node->GetId());
@@ -969,8 +1023,12 @@ class CamApp : public Application
         Ptr<Packet> packet = Create<Packet>(
             reinterpret_cast<const uint8_t*>(encodedCam.data()),
             encodedCam.size());
+        KpiPacketTag kpiTag;
+        kpiTag.SetSequence(kpiSeq);
+        kpiTag.SetTxTimeNs(Simulator::Now().GetNanoSeconds());
+        packet->AddPacketTag(kpiTag);
 
-        m_logger->LogTx(m_node->GetId(), camId, Simulator::Now(), pos);
+        m_logger->LogTx(m_node->GetId(), kpiSeq, Simulator::Now(), pos);
 
         InetSocketAddress remote = InetSocketAddress(m_groupIpv4, m_port);
         m_socket->SendTo(packet, 0, remote);
@@ -1183,6 +1241,12 @@ class CamApp : public Application
         std::vector<uint8_t> buffer(packet->GetSize());
         packet->CopyData(buffer.data(), buffer.size());
 
+        KpiPacketTag kpiTag;
+        if (!packet->PeekPacketTag(kpiTag))
+        {
+            return;
+        }
+
         CAM_t* cam = nullptr;
         asn_dec_rval_t decodeResult = uper_decode_complete(nullptr,
                                                            &asn_DEF_CAM,
@@ -1203,10 +1267,12 @@ class CamApp : public Application
         uint32_t txNodeId = m_logger->ResolveNodeIdFromIpv4(srcIp);
         if (txNodeId == std::numeric_limits<uint32_t>::max())
         {
+            ASN_STRUCT_FREE(asn_DEF_CAM, cam);
             return;
         }
-        const uint32_t camId = static_cast<uint32_t>(cam->cam.generationDeltaTime);
-        const double delayS = ComputeCamDelayS(camId, Simulator::Now());
+        const uint64_t kpiSeq = kpiTag.GetSequence();
+        const double delayS =
+            static_cast<double>(Simulator::Now().GetNanoSeconds() - kpiTag.GetTxTimeNs()) / 1e9;
         const uint32_t stationId = static_cast<uint32_t>(cam->header.stationId);
         ASN_STRUCT_FREE(asn_DEF_CAM, cam);
 
@@ -1226,7 +1292,7 @@ class CamApp : public Application
 
         m_logger->LogRx(txNodeId,
                         m_node->GetId(),
-                        camId,
+                        kpiSeq,
                         Simulator::Now(),
                         posTx,
                         posRx,
@@ -1252,6 +1318,7 @@ class CamApp : public Application
     uint32_t m_maxCamSizeBytes = 300;
 
     bool m_hasLastCamState = false;
+    uint64_t m_nextKpiSequence = 0;
     double m_lastCamTimeS = 0.0;
     double m_lastHeadingDeg = 0.0;
     double m_lastSpeedMps = 0.0;
