@@ -2,7 +2,10 @@
 
 #include "ns3/antenna-module.h"
 #include "ns3/applications-module.h"
+#include "ns3/btp.h"
+#include "ns3/caBasicService.h"
 #include "ns3/core-module.h"
+#include "ns3/geonet.h"
 #include "ns3/internet-module.h"
 #include "ns3/lte-module.h"
 #include "ns3/mobility-module.h"
@@ -10,9 +13,7 @@
 #include "ns3/nr-module.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/tag.h"
-#include "ns3/CAM.h"
-#include "ns3/uper_decoder.h"
-#include "ns3/uper_encoder.h"
+#include "ns3/vdp.h"
 
 #include "../src/cbr-logger.cc"
 
@@ -24,6 +25,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -156,11 +158,6 @@ static std::map<uint32_t, Ptr<Node>> g_nodeIdToNode;
  * Helpers
  ****************************************************************/
 
-static constexpr double kPi = 3.14159265358979323846;
-static constexpr double kDotOneMicro = 1e7;
-static constexpr double kLocalOriginLatitudeDeg = 37.0;
-static constexpr double kLocalOriginLongitudeDeg = -122.0;
-
 static double
 Distance2d(const Vector& a, const Vector& b)
 {
@@ -168,6 +165,11 @@ Distance2d(const Vector& a, const Vector& b)
     const double dy = a.y - b.y;
     return std::sqrt(dx * dx + dy * dy);
 }
+
+static constexpr double kPi = 3.14159265358979323846;
+static constexpr double kDotOneMicro = 1e7;
+static constexpr double kLocalOriginLatitudeDeg = 37.0;
+static constexpr double kLocalOriginLongitudeDeg = -122.0;
 
 static long
 ClampToLong(double value, long minValue, long maxValue)
@@ -191,12 +193,6 @@ EncodeLongitudeFromLocalX(double xM)
     const double metersPerDegLon = 111320.0 * std::cos(originLatRad);
     const double lonDeg = kLocalOriginLongitudeDeg + xM / metersPerDegLon;
     return ClampToLong(lonDeg * kDotOneMicro, -1799999999, 1800000000);
-}
-
-static uint32_t
-GenerationDeltaTimeMs(Time now)
-{
-    return static_cast<uint32_t>(now.GetMilliSeconds() % 65536);
 }
 
 static bool
@@ -914,11 +910,211 @@ class KpiLogger : public Object
     std::ofstream m_rxOut;
 };
 
-/****************************************************************
- * Custom CAM App
- ****************************************************************/
+class NgsimVehicleDataProvider : public VDP
+{
+  public:
+    explicit NgsimVehicleDataProvider(Ptr<Node> node)
+        : m_node(node)
+    {
+        const Vector pos = GetPositionVector();
+        m_lastDistancePosition = pos;
+        m_lastAccelerationSpeedMps = getSpeedValue();
+        m_lastAccelerationTime = Simulator::Now();
+    }
 
-class CamApp : public Application
+    CAM_mandatory_data_t getCAMMandatoryData() override
+    {
+        CAM_mandatory_data_t data;
+        const Vector pos = GetPositionVector();
+
+        data.speed = VDPValueConfidence<>(ClampToLong(getSpeedValue() * 100.0,
+                                                      SpeedValue_standstill,
+                                                      SpeedValue_outOfRange - 1),
+                                          SpeedConfidence_unavailable);
+        data.longitude = EncodeLongitudeFromLocalX(pos.x);
+        data.latitude = EncodeLatitudeFromLocalY(pos.y);
+        data.lane = 0;
+        data.altitude = VDPValueConfidence<>(AltitudeValue_unavailable,
+                                             AltitudeConfidence_unavailable);
+        data.posConfidenceEllipse = {SemiAxisLength_unavailable,
+                                     SemiAxisLength_unavailable,
+                                     Wgs84AngleValue_unavailable};
+        data.longAcceleration = VDPValueConfidence<>(GetLongitudinalAccelerationValue(),
+                                                     AccelerationConfidence_unavailable);
+        data.heading = VDPValueConfidence<>(ClampToLong(getHeadingValue() * 10.0,
+                                                        0,
+                                                        HeadingValue_doNotUse - 1),
+                                            HeadingConfidence_unavailable);
+        data.driveDirection = DriveDirection_forward;
+        data.curvature = VDPValueConfidence<>(CurvatureValue_unavailable,
+                                              CurvatureConfidence_unavailable);
+        data.curvature_calculation_mode = CurvatureCalculationMode_unavailable;
+        data.VehicleLength = VDPValueConfidence<long, long>(
+            45,
+            VehicleLengthConfidenceIndication_noTrailerPresent);
+        data.VehicleWidth = 18;
+        data.yawRate = VDPValueConfidence<>(YawRateValue_unavailable,
+                                            YawRateConfidence_unavailable);
+        return data;
+    }
+
+    CPM_mandatory_data_t getCPMMandatoryData() override
+    {
+        const CAM_mandatory_data_t cam = getCAMMandatoryData();
+        CPM_mandatory_data_t cpm;
+        cpm.speed = cam.speed;
+        cpm.longitude = cam.longitude;
+        cpm.latitude = cam.latitude;
+        cpm.altitude = cam.altitude;
+        cpm.posConfidenceEllipse = cam.posConfidenceEllipse;
+        cpm.longAcceleration = cam.longAcceleration;
+        cpm.heading = cam.heading;
+        cpm.driveDirection = cam.driveDirection;
+        cpm.curvature = cam.curvature;
+        cpm.curvature_calculation_mode = cam.curvature_calculation_mode;
+        cpm.VehicleLength = cam.VehicleLength;
+        cpm.VehicleWidth = cam.VehicleWidth;
+        cpm.yawRate = cam.yawRate;
+        return cpm;
+    }
+
+    MCM_mandatory_data_t getMCMMandatoryData() override
+    {
+        const CAM_mandatory_data_t cam = getCAMMandatoryData();
+        MCM_mandatory_data_t mcm;
+        mcm.speed = cam.speed;
+        mcm.longitude = cam.longitude;
+        mcm.latitude = cam.latitude;
+        mcm.lane = cam.lane;
+        mcm.altitude = cam.altitude;
+        mcm.posConfidenceEllipse = cam.posConfidenceEllipse;
+        mcm.longAcceleration = cam.longAcceleration;
+        mcm.heading = cam.heading;
+        mcm.driveDirection = cam.driveDirection;
+        mcm.curvature = cam.curvature;
+        mcm.curvature_calculation_mode = cam.curvature_calculation_mode;
+        mcm.VehicleLength = cam.VehicleLength;
+        mcm.VehicleWidth = cam.VehicleWidth;
+        mcm.yawRate = cam.yawRate;
+        return mcm;
+    }
+
+    double getSpeedValue() override
+    {
+        const Vector velocity = GetVelocityVector();
+        return std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+    }
+
+    double getTravelledDistance() override
+    {
+        const Vector pos = GetPositionVector();
+        m_travelledDistanceM += Distance2d(pos, m_lastDistancePosition);
+        m_lastDistancePosition = pos;
+        return m_travelledDistanceM;
+    }
+
+    double getHeadingValue() override
+    {
+        const Vector velocity = GetVelocityVector();
+        if (std::abs(velocity.x) < 1e-9 && std::abs(velocity.y) < 1e-9)
+        {
+            return m_lastHeadingDeg;
+        }
+
+        double headingDeg = 90.0 - std::atan2(velocity.y, velocity.x) * 180.0 / kPi;
+        while (headingDeg < 0.0)
+        {
+            headingDeg += 360.0;
+        }
+        while (headingDeg >= 360.0)
+        {
+            headingDeg -= 360.0;
+        }
+        m_lastHeadingDeg = headingDeg;
+        return headingDeg;
+    }
+
+    VDP_position_latlon_t getPosition() override
+    {
+        const Vector pos = GetPositionVector();
+        return {static_cast<double>(EncodeLatitudeFromLocalY(pos.y)) / kDotOneMicro,
+                static_cast<double>(EncodeLongitudeFromLocalX(pos.x)) / kDotOneMicro,
+                DBL_MAX};
+    }
+
+    VDP_position_cartesian_t getPositionXY() override
+    {
+        const Vector pos = GetPositionVector();
+        return {pos.x, pos.y, pos.z};
+    }
+
+    VDP_position_cartesian_t getXY(double lon, double lat) override
+    {
+        const double originLatRad = kLocalOriginLatitudeDeg * kPi / 180.0;
+        const double metersPerDegLon = 111320.0 * std::cos(originLatRad);
+        return {(lon - kLocalOriginLongitudeDeg) * metersPerDegLon,
+                (lat - kLocalOriginLatitudeDeg) * 111320.0,
+                DBL_MAX};
+    }
+
+    double getCartesianDist(double lon1, double lat1, double lon2, double lat2) override
+    {
+        const VDP_position_cartesian_t p1 = getXY(lon1, lat1);
+        const VDP_position_cartesian_t p2 = getXY(lon2, lat2);
+        const double dx = p1.x - p2.x;
+        const double dy = p1.y - p2.y;
+        return std::sqrt(dx * dx + dy * dy);
+    }
+
+    VDPDataItem<int> getLanePosition() override
+    {
+        return VDPDataItem<int>(false);
+    }
+
+    VDPDataItem<uint8_t> getExteriorLights() override
+    {
+        return VDPDataItem<uint8_t>(false);
+    }
+
+  private:
+    Vector GetPositionVector() const
+    {
+        Ptr<MobilityModel> mobility = m_node->GetObject<MobilityModel>();
+        return mobility ? mobility->GetPosition() : Vector();
+    }
+
+    Vector GetVelocityVector() const
+    {
+        Ptr<MobilityModel> mobility = m_node->GetObject<MobilityModel>();
+        return mobility ? mobility->GetVelocity() : Vector();
+    }
+
+    long GetLongitudinalAccelerationValue()
+    {
+        const Time now = Simulator::Now();
+        const double speedMps = getSpeedValue();
+        const double dt = (now - m_lastAccelerationTime).GetSeconds();
+        long accelerationValue = AccelerationValue_unavailable;
+        if (dt > 1e-9)
+        {
+            accelerationValue = ClampToLong((speedMps - m_lastAccelerationSpeedMps) * 10.0,
+                                            -160,
+                                            161);
+        }
+        m_lastAccelerationSpeedMps = speedMps;
+        m_lastAccelerationTime = now;
+        return accelerationValue;
+    }
+
+    Ptr<Node> m_node;
+    double m_travelledDistanceM = 0.0;
+    double m_lastHeadingDeg = 0.0;
+    double m_lastAccelerationSpeedMps = 0.0;
+    Time m_lastAccelerationTime;
+    Vector m_lastDistancePosition;
+};
+
+class CamApplication : public Application
 {
   public:
     void Setup(Ptr<Node> node,
@@ -938,15 +1134,11 @@ class CamApp : public Application
 
     void SetBeaconInterval(double tb)
     {
-        m_tGenCamMaxS = std::max(m_tGenCamMinS, tb);
+        m_tGenCamMaxS = std::max(0.1, tb);
+        m_caService.T_GenCamMax_ms = static_cast<long>(std::llround(m_tGenCamMaxS * 1000.0));
         if (!m_useEtsiCamGeneration)
         {
-            m_beaconIntervalS = tb;
-            if (m_running && m_txEvent.IsPending())
-            {
-                Simulator::Cancel(m_txEvent);
-                m_txEvent = Simulator::Schedule(Seconds(m_beaconIntervalS), &CamApp::SendPacket, this);
-            }
+            m_caService.T_GenCamMin_ms = m_caService.T_GenCamMax_ms;
         }
     }
 
@@ -968,33 +1160,41 @@ class CamApp : public Application
         {
             NS_FATAL_ERROR("Bind failed on node " << m_node->GetId());
         }
+        InetSocketAddress remote = InetSocketAddress(m_groupIpv4, m_port);
+        if (m_socket->Connect(remote) < 0)
+        {
+            NS_FATAL_ERROR("Connect failed on node " << m_node->GetId());
+        }
 
-        m_socket->SetRecvCallback(MakeCallback(&CamApp::ReceivePacket, this));
+        m_vdp = std::make_unique<NgsimVehicleDataProvider>(m_node);
+        m_geoNet = CreateObject<GeoNet>();
+        m_btp = CreateObject<btp>();
+        m_btp->setGeoNet(m_geoNet);
+
+        m_caService.setBTP(m_btp);
+        m_caService.setVDP(m_vdp.get());
+        m_btp->setVDP(m_vdp.get());
+        m_caService.setStationProperties(m_node->GetId(), StationType_passengerCar);
+        m_caService.setRealTime(false);
+        m_caService.setSocketTx(m_socket);
+        m_caService.setSocketRx(m_socket);
+        m_caService.addCATxPacketCallback(
+            std::bind(&CamApplication::TagAndLogTx, this, std::placeholders::_1));
+        m_caService.addCARxPacketCallback(
+            std::bind(&CamApplication::ReceiveCam,
+                      this,
+                      std::placeholders::_1,
+                      std::placeholders::_2,
+                      std::placeholders::_3));
 
         const double desyncS = GetDeterministicDesync();
-        if (m_useEtsiCamGeneration)
-        {
-            m_checkEvent = Simulator::Schedule(Seconds(desyncS), &CamApp::CheckCamConditions, this);
-        }
-        else
-        {
-            m_txEvent = Simulator::Schedule(Seconds(desyncS), &CamApp::SendPacket, this);
-        }
+        m_caService.startCamDissemination(desyncS);
     }
 
     void StopApplication() override
     {
         m_running = false;
-
-        if (m_txEvent.IsPending())
-        {
-            Simulator::Cancel(m_txEvent);
-        }
-
-        if (m_checkEvent.IsPending())
-        {
-            Simulator::Cancel(m_checkEvent);
-        }
+        m_caService.terminateDissemination();
 
         if (m_socket)
         {
@@ -1004,261 +1204,39 @@ class CamApp : public Application
     }
 
   private:
-    void SendPacket()
+    void TagAndLogTx(Ptr<Packet> packet)
     {
-        if (!m_running || !m_socket)
+        if (!m_running || !packet)
         {
             return;
         }
 
-        Vector pos = m_node->GetObject<MobilityModel>()->GetPosition();
         const uint64_t kpiSeq = m_nextKpiSequence++;
-        const uint32_t generationDeltaTimeMs = GenerationDeltaTimeMs(Simulator::Now());
-        const std::string encodedCam = BuildEncodedCam(pos, generationDeltaTimeMs);
-        if (encodedCam.empty())
-        {
-            NS_FATAL_ERROR("Failed to encode CAM on node " << m_node->GetId());
-        }
-
-        Ptr<Packet> packet = Create<Packet>(
-            reinterpret_cast<const uint8_t*>(encodedCam.data()),
-            encodedCam.size());
         KpiPacketTag kpiTag;
         kpiTag.SetSequence(kpiSeq);
         kpiTag.SetTxTimeNs(Simulator::Now().GetNanoSeconds());
         packet->AddPacketTag(kpiTag);
 
+        Vector pos = m_node->GetObject<MobilityModel>()->GetPosition();
         m_logger->LogTx(m_node->GetId(), kpiSeq, Simulator::Now(), pos);
-
-        InetSocketAddress remote = InetSocketAddress(m_groupIpv4, m_port);
-        m_socket->SendTo(packet, 0, remote);
-
-        StoreLastCamState(pos);
-
-        if (!m_useEtsiCamGeneration)
-        {
-            m_txEvent = Simulator::Schedule(Seconds(m_beaconIntervalS), &CamApp::SendPacket, this);
-        }
-    }
-
-    std::string BuildEncodedCam(const Vector& pos, uint32_t generationDeltaTimeMs) const
-    {
-        CAM_t cam{};
-
-        cam.header.protocolVersion = 2;
-        cam.header.messageId = MessageId_cam;
-        cam.header.stationId = m_node->GetId();
-
-        cam.cam.generationDeltaTime = generationDeltaTimeMs;
-        cam.cam.camParameters.basicContainer.stationType =
-            TrafficParticipantType_passengerCar;
-        cam.cam.camParameters.basicContainer.referencePosition.latitude =
-            EncodeLatitudeFromLocalY(pos.y);
-        cam.cam.camParameters.basicContainer.referencePosition.longitude =
-            EncodeLongitudeFromLocalX(pos.x);
-        cam.cam.camParameters.basicContainer.referencePosition.positionConfidenceEllipse
-            .semiMajorAxisLength = SemiAxisLength_unavailable;
-        cam.cam.camParameters.basicContainer.referencePosition.positionConfidenceEllipse
-            .semiMinorAxisLength = SemiAxisLength_unavailable;
-        cam.cam.camParameters.basicContainer.referencePosition.positionConfidenceEllipse
-            .semiMajorAxisOrientation = Wgs84AngleValue_unavailable;
-        cam.cam.camParameters.basicContainer.referencePosition.altitude.altitudeValue =
-            AltitudeValue_unavailable;
-        cam.cam.camParameters.basicContainer.referencePosition.altitude.altitudeConfidence =
-            AltitudeConfidence_unavailable;
-
-        BasicVehicleContainerHighFrequency_t& vehicle =
-            cam.cam.camParameters.highFrequencyContainer.choice.basicVehicleContainerHighFrequency;
-        cam.cam.camParameters.highFrequencyContainer.present =
-            HighFrequencyContainer_PR_basicVehicleContainerHighFrequency;
-        vehicle.heading.headingValue =
-            ClampToLong(GetEtsiHeadingDeg() * 10.0, 0, HeadingValue_doNotUse - 1);
-        vehicle.heading.headingConfidence = HeadingConfidence_unavailable;
-        vehicle.speed.speedValue =
-            ClampToLong(GetSpeedMps() * 100.0, SpeedValue_standstill, SpeedValue_outOfRange - 1);
-        vehicle.speed.speedConfidence = SpeedConfidence_unavailable;
-        vehicle.driveDirection = DriveDirection_forward;
-        vehicle.vehicleLength.vehicleLengthValue = 45; // 4.5 m in 0.1 m units.
-        vehicle.vehicleLength.vehicleLengthConfidenceIndication =
-            VehicleLengthConfidenceIndication_noTrailerPresent;
-        vehicle.vehicleWidth = 18; // 1.8 m in 0.1 m units.
-        vehicle.longitudinalAcceleration.value = AccelerationValue_unavailable;
-        vehicle.longitudinalAcceleration.confidence = AccelerationConfidence_unavailable;
-        vehicle.curvature.curvatureValue = CurvatureValue_unavailable;
-        vehicle.curvature.curvatureConfidence = CurvatureConfidence_unavailable;
-        vehicle.curvatureCalculationMode = CurvatureCalculationMode_unavailable;
-        vehicle.yawRate.yawRateValue = YawRateValue_unavailable;
-        vehicle.yawRate.yawRateConfidence = YawRateConfidence_unavailable;
-
-        std::vector<uint8_t> buffer(m_maxCamSizeBytes);
-        asn_enc_rval_t result = uper_encode_to_buffer(&asn_DEF_CAM,
-                                                       nullptr,
-                                                       &cam,
-                                                       buffer.data(),
-                                                       buffer.size());
-        if (result.encoded < 0)
-        {
-            return {};
-        }
-
-        const std::size_t encodedBytes = static_cast<std::size_t>((result.encoded + 7) / 8);
-        if (encodedBytes > m_maxCamSizeBytes)
-        {
-            NS_FATAL_ERROR("Encoded CAM size " << encodedBytes
-                                               << " exceeds configured packetSize/max buffer "
-                                               << m_maxCamSizeBytes);
-        }
-        return std::string(reinterpret_cast<const char*>(buffer.data()), encodedBytes);
-    }
-
-    void CheckCamConditions()
-    {
-        if (!m_running || !m_socket)
-        {
-            return;
-        }
-
-        const Vector pos = m_node->GetObject<MobilityModel>()->GetPosition();
-        const double nowS = Simulator::Now().GetSeconds();
-
-        if (!m_hasLastCamState)
-        {
-            SendPacket();
-            ScheduleNextCamConditionCheck();
-            return;
-        }
-
-        const double elapsedS = nowS - m_lastCamTimeS;
-        if (elapsedS + 1e-9 < m_tGenCamMinS)
-        {
-            ScheduleNextCamConditionCheck();
-            return;
-        }
-
-        const double headingDiffDeg = SmallestHeadingDiffDeg(GetHeadingDeg(), m_lastHeadingDeg);
-        const double distanceDiffM = Distance2d(pos, m_lastCamPosition);
-        const double speedDiffMps = std::abs(GetSpeedMps() - m_lastSpeedMps);
-
-        const bool dynamicTrigger = std::abs(headingDiffDeg) > m_headingDeltaThresholdDeg ||
-                                    distanceDiffM > m_positionDeltaThresholdM ||
-                                    speedDiffMps > m_speedDeltaThresholdMps;
-        const bool maxIntervalTrigger = elapsedS + 1e-9 >= m_tGenCamMaxS;
-
-        if (dynamicTrigger || maxIntervalTrigger)
-        {
-            SendPacket();
-        }
-
-        ScheduleNextCamConditionCheck();
-    }
-
-    void ScheduleNextCamConditionCheck()
-    {
-        if (m_running)
-        {
-            m_checkEvent =
-                Simulator::Schedule(Seconds(m_tCheckCamGenS), &CamApp::CheckCamConditions, this);
-        }
-    }
-
-    void StoreLastCamState(const Vector& pos)
-    {
-        m_lastCamPosition = pos;
-        m_lastHeadingDeg = GetHeadingDeg();
-        m_lastSpeedMps = GetSpeedMps();
-        m_lastCamTimeS = Simulator::Now().GetSeconds();
-        m_hasLastCamState = true;
-    }
-
-    double GetSpeedMps() const
-    {
-        const Vector velocity = m_node->GetObject<MobilityModel>()->GetVelocity();
-        return std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
-    }
-
-    double GetHeadingDeg() const
-    {
-        const Vector velocity = m_node->GetObject<MobilityModel>()->GetVelocity();
-        if (std::abs(velocity.x) < 1e-9 && std::abs(velocity.y) < 1e-9)
-        {
-            return m_hasLastCamState ? m_lastHeadingDeg : 0.0;
-        }
-
-        constexpr double pi = 3.14159265358979323846;
-        double headingDeg = std::atan2(velocity.y, velocity.x) * 180.0 / pi;
-        if (headingDeg < 0.0)
-        {
-            headingDeg += 360.0;
-        }
-        return headingDeg;
-    }
-
-    double GetEtsiHeadingDeg() const
-    {
-        double headingDeg = 90.0 - GetHeadingDeg();
-        while (headingDeg < 0.0)
-        {
-            headingDeg += 360.0;
-        }
-        while (headingDeg >= 360.0)
-        {
-            headingDeg -= 360.0;
-        }
-        return headingDeg;
-    }
-
-    static double SmallestHeadingDiffDeg(double currentDeg, double previousDeg)
-    {
-        double diff = currentDeg - previousDeg;
-        while (diff > 180.0)
-        {
-            diff -= 360.0;
-        }
-        while (diff < -180.0)
-        {
-            diff += 360.0;
-        }
-        return diff;
     }
 
     double GetDeterministicDesync() const
     {
         const double fractional = std::fmod((m_node->GetId() + 1) * 0.6180339887498948, 1.0);
-        const double windowS = m_useEtsiCamGeneration ? m_tGenCamMaxS : m_beaconIntervalS;
-        return fractional * std::max(m_tCheckCamGenS, windowS);
+        return fractional * std::max(0.1, m_tGenCamMaxS);
     }
 
-    void ReceivePacket(Ptr<Socket> socket)
+    void ReceiveCam(asn1cpp::Seq<CAM> cam, Address from, Ptr<Packet> packet)
     {
-        Address from;
-        Ptr<Packet> packet = socket->RecvFrom(from);
-
         if (!packet || packet->GetSize() == 0)
         {
             return;
         }
 
-        std::vector<uint8_t> buffer(packet->GetSize());
-        packet->CopyData(buffer.data(), buffer.size());
-
         KpiPacketTag kpiTag;
         if (!packet->PeekPacketTag(kpiTag))
         {
-            return;
-        }
-
-        CAM_t* cam = nullptr;
-        asn_dec_rval_t decodeResult = uper_decode_complete(nullptr,
-                                                           &asn_DEF_CAM,
-                                                           reinterpret_cast<void**>(&cam),
-                                                           buffer.data(),
-                                                           buffer.size());
-        if (decodeResult.code != RC_OK || !cam)
-        {
-            if (cam)
-            {
-                ASN_STRUCT_FREE(asn_DEF_CAM, cam);
-            }
             return;
         }
 
@@ -1267,14 +1245,12 @@ class CamApp : public Application
         uint32_t txNodeId = m_logger->ResolveNodeIdFromIpv4(srcIp);
         if (txNodeId == std::numeric_limits<uint32_t>::max())
         {
-            ASN_STRUCT_FREE(asn_DEF_CAM, cam);
             return;
         }
         const uint64_t kpiSeq = kpiTag.GetSequence();
         const double delayS =
             static_cast<double>(Simulator::Now().GetNanoSeconds() - kpiTag.GetTxTimeNs()) / 1e9;
-        const uint32_t stationId = static_cast<uint32_t>(cam->header.stationId);
-        ASN_STRUCT_FREE(asn_DEF_CAM, cam);
+        const uint32_t stationId = asn1cpp::getField(cam->header.stationId, uint32_t);
 
         if (stationId != txNodeId)
         {
@@ -1302,34 +1278,25 @@ class CamApp : public Application
     Ptr<Node> m_node;
     Ptr<KpiLogger> m_logger;
     Ptr<Socket> m_socket;
+    Ptr<btp> m_btp;
+    Ptr<GeoNet> m_geoNet;
+    CABasicService m_caService;
+    std::unique_ptr<NgsimVehicleDataProvider> m_vdp;
 
     bool m_running = false;
     bool m_useEtsiCamGeneration = true;
-    EventId m_txEvent;
-    EventId m_checkEvent;
 
-    double m_beaconIntervalS = 0.1;
-    double m_tCheckCamGenS = 0.1;
-    double m_tGenCamMinS = 0.1;
     double m_tGenCamMaxS = 1.0;
-    double m_headingDeltaThresholdDeg = 4.0;
-    double m_positionDeltaThresholdM = 4.0;
-    double m_speedDeltaThresholdMps = 0.5;
     uint32_t m_maxCamSizeBytes = 300;
 
-    bool m_hasLastCamState = false;
     uint64_t m_nextKpiSequence = 0;
-    double m_lastCamTimeS = 0.0;
-    double m_lastHeadingDeg = 0.0;
-    double m_lastSpeedMps = 0.0;
-    Vector m_lastCamPosition;
 
     Ipv4Address m_localIpv4;
     Ipv4Address m_groupIpv4;
     uint16_t m_port = 8000;
 };
 
-static std::map<uint32_t, Ptr<CamApp>> g_apps;
+static std::map<uint32_t, Ptr<CamApplication>> g_apps;
 
 static void
 ApplyTxPowerToAllUes(const NetDeviceContainer& ueDevs, double pDbm)
@@ -1576,14 +1543,14 @@ main(int argc, char* argv[])
     double simTimeSeconds = 10.0;
     double warmupS = 10.0;
     double cooldownS = 10.0;
-    uint32_t seed = 12345;
+    uint32_t seed = 12345; // 12345, 12346, 12347 for runs 1, 2, 3
     uint32_t run = 1;
 
     // Traffic / app
     bool useIPv6 = false;
     uint32_t maxCamSizeBytes = 300;
     uint16_t port = 8000;
-    bool useInputSchedule = false;
+    bool useInputSchedule = true;
     bool etsiCamGeneration = true;
     double fixedBeaconIntervalS = 0.1;
 
@@ -1613,7 +1580,7 @@ main(int argc, char* argv[])
     bool enableChannelRandomness = true;
     uint16_t channelUpdatePeriod = 500;
     uint16_t mcs = 6;
-    double awarenessRangeM = 150.0;
+    double awarenessRangeM = 300.0;
     double kpiWindowS = 1.0;
     double sampleTimeS = 0.1;
     uint32_t maxVehicles = 0; // 0 means all vehicles
@@ -1993,14 +1960,14 @@ main(int argc, char* argv[])
     logger->SetCurrentInputs(txPower, fixedBeaconIntervalS);
     ApplyTxPowerToAllUes(allSlUesNetDeviceContainer, txPower);
 
-    /**************** Custom CAM apps ****************/
+    /**************** Automotive CAM apps ****************/
     for (uint32_t i = 0; i < allSlUesContainer.GetN(); ++i)
     {
         Ptr<Node> node = allSlUesContainer.Get(i);
         Ipv4Address localAddr =
             node->GetObject<Ipv4L3Protocol>()->GetAddress(1, 0).GetLocal();
 
-        Ptr<CamApp> app = CreateObject<CamApp>();
+        Ptr<CamApplication> app = CreateObject<CamApplication>();
         app->Setup(node, logger, localAddr, groupAddress4, port, maxCamSizeBytes);
         app->SetEtsiCamGeneration(etsiCamGeneration);
         app->SetBeaconInterval(fixedBeaconIntervalS);
