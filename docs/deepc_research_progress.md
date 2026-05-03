@@ -133,3 +133,77 @@ Not done yet:
 - Hyperparameter sweep over DeePC horizons.
 - Separate metrics by density regime.
 - Comparison to threshold-DCC and fixed-input baselines using the same outputs.
+
+## Step 2: acados Installation for C/C++ Closed-Loop Control
+
+Status: completed locally.
+
+Reason:
+
+- The closed-loop DeePC implementation should move toward acados/C++ rather than
+  MATLAB/YALMIP, because the long-term target is fast controller execution near
+  the ns-3 simulation loop.
+
+Installed local paths:
+
+- acados source: `external/acados`
+- acados install prefix: `external/acados-install`
+- acados shared library: `external/acados-install/lib/libacados.so`
+- acados Python interface: editable install from
+  `external/acados/interfaces/acados_template`
+- Tera renderer: `external/acados/bin/t_renderer`
+
+Commands run:
+
+```bash
+mkdir -p external
+git clone https://github.com/acados/acados.git external/acados
+git submodule update --init --recursive
+cmake -S external/acados -B external/acados/build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/home/bim/ns-3-dev/external/acados-install \
+  -DACADOS_WITH_QPOASES=ON \
+  -DACADOS_WITH_OSQP=ON
+cmake --build external/acados/build --target install -j 4
+./v2x_env/bin/python -m pip install casadi
+./v2x_env/bin/python -m pip install -e external/acados/interfaces/acados_template
+env MPLCONFIGDIR=/tmp/matplotlib \
+  ACADOS_SOURCE_DIR=/home/bim/ns-3-dev/external/acados \
+  ./v2x_env/bin/python -c "from acados_template import get_tera; print(get_tera(force_download=True))"
+```
+
+Verification:
+
+```bash
+external/acados/bin/t_renderer --help
+env MPLCONFIGDIR=/tmp/matplotlib \
+  ACADOS_SOURCE_DIR=/home/bim/ns-3-dev/external/acados \
+  LD_LIBRARY_PATH=/home/bim/ns-3-dev/external/acados-install/lib \
+  ./v2x_env/bin/python - <<'PY'
+from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
+import casadi as ca
+print(ca.__version__)
+print("imports ok")
+PY
+```
+
+Verification result:
+
+- `t_renderer` is executable.
+- `acados_template` imports successfully.
+- CasADi version installed: 3.7.2.
+- acados libraries were installed under `external/acados-install/lib`.
+
+Important environment variables for future acados scripts:
+
+```bash
+export ACADOS_SOURCE_DIR=/home/bim/ns-3-dev/external/acados
+export LD_LIBRARY_PATH=/home/bim/ns-3-dev/external/acados-install/lib:$LD_LIBRARY_PATH
+export MPLCONFIGDIR=/tmp/matplotlib
+```
+
+Not done yet:
+
+- generate a DeePC-specific acados solver.
+- build a C++ wrapper around the generated solver.
+- connect the generated controller to ns-3.
