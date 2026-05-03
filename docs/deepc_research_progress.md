@@ -207,3 +207,82 @@ Not done yet:
 - generate a DeePC-specific acados solver.
 - build a C++ wrapper around the generated solver.
 - connect the generated controller to ns-3.
+
+## Step 3: Closed-Loop Linearized DeePC with acados
+
+Status: completed as an offline surrogate closed-loop rollout.
+
+Implemented file:
+
+- `scripts/closed_loop_linear_deepc_acados.py`
+
+Method:
+
+- Fit a one-step linearized DeePC predictor from normalized train+validation
+  data.
+- Use the DeePC history buffer as the acados discrete-time state:
+  past inputs, past outputs, and past traffic/context variables.
+- Use physical controls as acados inputs:
+  `tx_power_dbm` and `beacon_interval_s`.
+- Use measured held-out future context as stage parameters.
+- Optimize a receding-horizon objective for PRR/PIR/CBR tracking, input level,
+  and input movement.
+- Roll out the controller on the held-out test segment without running ns-3.
+
+Command run:
+
+```bash
+env MPLCONFIGDIR=/tmp/matplotlib \
+  ACADOS_SOURCE_DIR=/home/bim/ns-3-dev/external/acados \
+  LD_LIBRARY_PATH=/home/bim/ns-3-dev/external/acados-install/lib:$LD_LIBRARY_PATH \
+  ./v2x_env/bin/python scripts/closed_loop_linear_deepc_acados.py
+```
+
+Generated files:
+
+- `data/output/deepc_open_loop_250veh/closed_loop_linear_deepc_acados/closed_loop_rollout.csv`
+- `data/output/deepc_open_loop_250veh/closed_loop_linear_deepc_acados/closed_loop_control_schedule.csv`
+- `data/output/deepc_open_loop_250veh/closed_loop_linear_deepc_acados/closed_loop_metrics.json`
+- `data/output/deepc_open_loop_250veh/closed_loop_linear_deepc_acados/one_step_linear_deepc_beta.npy`
+- `data/output/deepc_open_loop_250veh/closed_loop_linear_deepc_acados/acados_generated/`
+- `data/output/deepc_open_loop_250veh/closed_loop_linear_deepc_acados/plots/closed_loop_timeseries.png`
+
+400-step surrogate rollout metrics:
+
+| Metric | Value |
+|---|---:|
+| predicted closed-loop PRR mean | 0.790244 |
+| measured open-loop PRR mean on same segment | 0.628639 |
+| predicted closed-loop PIR mean | 0.340756 |
+| measured open-loop PIR mean on same segment | 0.252873 |
+| predicted closed-loop CBR mean | 0.253013 |
+| measured open-loop CBR mean on same segment | 0.335500 |
+| predicted closed-loop CBR > 0.6 rate | 0.000000 |
+| measured open-loop CBR > 0.6 rate | 0.000000 |
+| mean selected Tx power | 17.165739 dBm |
+| mean selected beacon interval | 0.500000 s |
+
+Interpretation:
+
+- The acados controller is operational and produces a closed-loop schedule.
+- On the learned surrogate, the controller improves PRR and lowers CBR compared
+  with the held-out measured open-loop segment.
+- The optimizer drives `beacon_interval_s` to its upper bound, so the next
+  research step must check whether this is physically desirable or whether the
+  cost should penalize large PIR / low awareness more strongly.
+- These results are not yet ns-3 closed-loop results. They are surrogate
+  closed-loop results and must be replayed in ns-3 before making final claims.
+
+Validation:
+
+```bash
+./v2x_env/bin/python -m py_compile scripts/closed_loop_linear_deepc_acados.py
+```
+
+Not done yet:
+
+- tune the objective to avoid trivial upper-bound `Tb` behavior if needed.
+- replay `closed_loop_control_schedule.csv` in ns-3.
+- compare against fixed-input, PRBS, and threshold-DCC baselines on identical
+  evaluation windows.
+- build the C++ wrapper around the generated acados solver.
