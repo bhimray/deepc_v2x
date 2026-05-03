@@ -1,0 +1,135 @@
+# DeePC / RoKDeePC V2X Research Progress Log
+
+This file records the DeePC research workflow step by step so the work remains
+recoverable, auditable, and easy to turn into paper methodology.
+
+## Current Goal
+
+Use the existing ns-3 NR-V2X NGSIM open-loop dataset to build and validate
+offline DeePC and kernelized DeePC predictors before attempting closed-loop
+control inside ns-3.
+
+Primary control objective:
+
+- balance reliability and congestion by predicting/improving PRR while keeping
+  CBR below the congestion-control target of 0.6.
+
+## Step 0: Existing Data Checkpoint
+
+Status: completed before this log was created.
+
+Important existing artifacts:
+
+- `data/output/kpi_timeseries_10min_250veh_run01.csv`
+- `data/output/kpi_timeseries_10min_250veh_run01_metadata.json`
+- `data/output/kpi_timeseries_10min_250veh_run01_tx_packet_log.csv`
+- `data/output/kpi_timeseries_10min_250veh_run01_rx_packet_log.csv`
+- `data/output/cbr_timeseries_10min_250veh_run01.csv`
+
+Observed dataset facts:
+
+- simulation duration: 600 s
+- sample time: 0.1 s
+- KPI samples: 5999
+- evaluation window from metadata: 10 s to 590 s
+- vehicle count: 250
+- input schedule: PRBS over Tx power and beacon interval
+- DeePC-ready inputs: `tx_power_dbm`, `beacon_interval_s`
+- DeePC-ready outputs: `prr_150m`, `pir_s`, `cbr`
+- traffic/context variables: `active_vehicle_count_core`,
+  `density_veh_per_km_core`, `mean_neighbors_150m`,
+  `mean_neighbors_300m`, `sensing_exclusion_ratio`
+
+Initial KPI summary from the existing data:
+
+- mean CBR: about 0.326
+- mean PRR at 150 m: about 0.555
+- mean PIR: about 0.293 s
+
+Interpretation:
+
+- The data is valuable and should be reused before running another expensive
+  ns-3 experiment.
+- The first DeePC milestone should be open-loop prediction and validation,
+  not closed-loop ns-3 control.
+
+Not done yet:
+
+- DeePC train/validation/test dataset construction.
+- Hankel matrix export.
+- Linear DeePC-style open-loop prediction.
+- Kernelized/RoKDeePC-style open-loop prediction.
+- Prediction plots and quantitative metrics.
+
+## Step 1: Offline DeePC Tooling Implementation
+
+Status: completed.
+
+Changes made:
+
+- Replaced `scripts/build_hankel_dataset.py` with a configurable builder.
+- Added `scripts/open_loop_deepc_predict.py` for held-out open-loop prediction.
+- Wrote generated DeePC artifacts under `data/output/deepc_open_loop_250veh/`.
+
+Commands run:
+
+```bash
+./v2x_env/bin/python scripts/build_hankel_dataset.py
+./v2x_env/bin/python scripts/open_loop_deepc_predict.py
+```
+
+Dataset builder result:
+
+- clean evaluation-window rows: 5801
+- train rows: 3480
+- validation rows: 1160
+- test rows: 1161
+- train Hankel windows: 3451
+- default past horizon: 20 samples = 2.0 s
+- default future horizon: 10 samples = 1.0 s
+
+Generated dataset files:
+
+- `data/output/deepc_open_loop_250veh/deepc_clean.csv`
+- `data/output/deepc_open_loop_250veh/deepc_train.csv`
+- `data/output/deepc_open_loop_250veh/deepc_val.csv`
+- `data/output/deepc_open_loop_250veh/deepc_test.csv`
+- `data/output/deepc_open_loop_250veh/deepc_*_normalized.csv`
+- `data/output/deepc_open_loop_250veh/scaler.json`
+- `data/output/deepc_open_loop_250veh/dataset_summary.json`
+- `data/output/deepc_open_loop_250veh/hankel_train_normalized.npz`
+
+Open-loop prediction result on held-out test data:
+
+| Model | Output | RMSE | MAE | R2 |
+|---|---:|---:|---:|---:|
+| linear_deepc | PRR | 0.044752 | 0.033825 | 0.716919 |
+| linear_deepc | PIR | 0.042447 | 0.030457 | 0.635272 |
+| linear_deepc | CBR | 0.013252 | 0.009960 | 0.792872 |
+| kernel_rokdeepc | PRR | 0.046903 | 0.035616 | 0.689058 |
+| kernel_rokdeepc | PIR | 0.046259 | 0.032920 | 0.566820 |
+| kernel_rokdeepc | CBR | 0.014893 | 0.011430 | 0.738389 |
+
+Generated prediction files:
+
+- `data/output/deepc_open_loop_250veh/open_loop_predictions/metrics.json`
+- `data/output/deepc_open_loop_250veh/open_loop_predictions/first_step_predictions.csv`
+- `data/output/deepc_open_loop_250veh/open_loop_predictions/plots/`
+
+Interpretation:
+
+- The existing 18-hour PRBS dataset is sufficient for a first open-loop DeePC
+  result.
+- Linear DeePC-style prediction currently performs slightly better than the
+  tuned RBF kernel predictor on this held-out split.
+- CBR prediction is strong enough to support the next stage of control-oriented
+  analysis.
+- PRR prediction is promising but should be stress-tested across different
+  horizons, density regimes, and train/test splits before making a paper claim.
+
+Not done yet:
+
+- Closed-loop DeePC or RoKDeePC control in ns-3.
+- Hyperparameter sweep over DeePC horizons.
+- Separate metrics by density regime.
+- Comparison to threshold-DCC and fixed-input baselines using the same outputs.
