@@ -14,14 +14,33 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
-os.environ.setdefault("ACADOS_SOURCE_DIR", "/home/bim/ns-3-dev/external/acados")
-os.environ["LD_LIBRARY_PATH"] = (
-    "/home/bim/ns-3-dev/external/acados-install/lib:"
-    + os.environ.get("LD_LIBRARY_PATH", "")
-)
+ACADOS_SOURCE_DIR = Path("/home/bim/ns-3-dev/external/acados")
+ACADOS_INSTALL_DIR = Path("/home/bim/ns-3-dev/external/acados-install")
+ACADOS_LIB_DIR = ACADOS_INSTALL_DIR / "lib"
+
+
+def ensure_acados_process_environment() -> None:
+    """Restart Python once with acados runtime paths visible to the dynamic linker."""
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    os.environ.setdefault("ACADOS_SOURCE_DIR", str(ACADOS_SOURCE_DIR))
+
+    lib_dir = str(ACADOS_LIB_DIR)
+    ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
+    if os.environ.get("DEEPC_ACADOS_ENV_READY") == "1" and lib_dir in ld_paths:
+        return
+
+    if lib_dir not in ld_paths:
+        os.environ["LD_LIBRARY_PATH"] = lib_dir + (
+            ":" + os.environ["LD_LIBRARY_PATH"] if os.environ.get("LD_LIBRARY_PATH") else ""
+        )
+    os.environ["DEEPC_ACADOS_ENV_READY"] = "1"
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+ensure_acados_process_environment()
 
 import matplotlib
 
@@ -36,7 +55,6 @@ from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 
 DEFAULT_DATASET_DIR = Path("data/output/deepc_open_loop_250veh")
 DEFAULT_OUT_DIR = DEFAULT_DATASET_DIR / "closed_loop_linear_deepc_acados"
-ACADOS_INSTALL_DIR = Path("/home/bim/ns-3-dev/external/acados-install")
 
 
 def parse_args() -> argparse.Namespace:

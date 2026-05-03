@@ -279,6 +279,28 @@ Validation:
 ./v2x_env/bin/python -m py_compile scripts/closed_loop_linear_deepc_acados.py
 ```
 
+Follow-up runtime fix:
+
+- Running the script as plain `python scripts/closed_loop_linear_deepc_acados.py`
+  initially failed with `OSError: libqpOASES_e.so: cannot open shared object
+  file`.
+- Cause: `LD_LIBRARY_PATH` must be visible before Python starts; changing it
+  inside an already running Python process is too late for the dynamic linker.
+- Fix: the script now re-executes itself once with `LD_LIBRARY_PATH`,
+  `ACADOS_SOURCE_DIR`, and `MPLCONFIGDIR` set before importing acados.
+
+Verification command:
+
+```bash
+./v2x_env/bin/python scripts/closed_loop_linear_deepc_acados.py --no-build
+```
+
+Verification result:
+
+- plain venv Python invocation succeeds.
+- generated solver reuse works.
+- full 400-step rollout artifacts were restored after the smoke test.
+
 Not done yet:
 
 - tune the objective to avoid trivial upper-bound `Tb` behavior if needed.
