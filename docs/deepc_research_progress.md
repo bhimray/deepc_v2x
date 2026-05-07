@@ -308,3 +308,97 @@ Not done yet:
 - compare against fixed-input, PRBS, and threshold-DCC baselines on identical
   evaluation windows.
 - build the C++ wrapper around the generated acados solver.
+
+## ns-3 File-Bridge Closed-Loop Scaffold
+
+Goal:
+
+- Prepare `scratch/nr_v2x_ngsim_deepc_copy.cc` for true controller-in-the-loop
+  simulation without overwriting the open-loop data used for Hankel matrices.
+- Implement the first bridge slice before MATLAB/YALMIP integration:
+  ns-3 writes DeePC request JSON, an external controller writes response JSON,
+  and ns-3 applies the returned control.
+
+Implemented:
+
+- Added safe default output paths in the copy scenario:
+  - `data/output/kpi_timeseries_deepc_copy_run01.csv`
+  - `data/output/cbr_timeseries_deepc_copy_run01.csv`
+- Added protected-output guard that refuses to write to:
+  - `data/output/kpi_timeseries_10min_250veh_run01.csv`
+  - `data/output/cbr_timeseries_10min_250veh_run01.csv`
+  - `data/output/deepc_open_loop_250veh/`
+- Added `KpiSample` storage in `KpiLogger`.
+- Added optional file bridge controlled by:
+  - `--enableDeepcBridge`
+  - `--deepcBridgeDir`
+  - `--deepcControlInterval`
+  - `--deepcPastHorizon`
+  - `--deepcFutureHorizon`
+  - `--deepcResponseTimeout`
+- Added request/response bridge artifacts:
+  - `bridge/requests/request_XXXXXX.json`
+  - `bridge/responses/response_XXXXXX.json`
+  - `bridge/applied_controls.csv`
+  - `bridge/controller_solve_times.csv`
+- Added `scripts/dummy_deepc_file_controller.py` for bridge smoke tests.
+
+Important behavior:
+
+- Bridge mode is disabled by default.
+- Bridge mode currently requires `--useInputSchedule=false` to avoid PRBS
+  updates fighting with closed-loop controller updates.
+- Future context `d_future` is currently a repeated-current-context forecast.
+  A later research version can replace this with NGSIM oracle mobility context.
+
+Validation:
+
+```bash
+./v2x_env/bin/python -m py_compile scripts/dummy_deepc_file_controller.py
+CCACHE_DISABLE=1 ./ns3 build nr_v2x_ngsim_deepc_copy
+CCACHE_DISABLE=1 ./ns3 run "nr_v2x_ngsim_deepc_copy --validateOnly=true --enableDeepcBridge=true --useInputSchedule=false --maxVehicles=25 --simTime=290"
+```
+
+Bridge/PRBS conflict rejection test:
+
+```bash
+CCACHE_DISABLE=1 ./ns3 run "nr_v2x_ngsim_deepc_copy --validateOnly=true --enableDeepcBridge=true --maxVehicles=25 --simTime=290"
+```
+
+Protected-path rejection test:
+
+```bash
+CCACHE_DISABLE=1 ./ns3 run "nr_v2x_ngsim_deepc_copy --validateOnly=true --kpiCsv=data/output/kpi_timeseries_10min_250veh_run01.csv"
+```
+
+Results:
+
+- The run aborts because bridge mode cannot run with the PRBS input schedule.
+- The protected-output test aborts when `kpiCsv` points at the original
+  open-loop KPI file.
+
+Bridge smoke test:
+
+```bash
+./v2x_env/bin/python scripts/dummy_deepc_file_controller.py \
+  --bridge-dir data/output/deepc_bridge_smoke_20260507_01/bridge \
+  --tx-power-dbm 16 \
+  --beacon-interval-s 0.12 \
+  --idle-timeout-s 45
+
+CCACHE_DISABLE=1 ./ns3 run "nr_v2x_ngsim_deepc_copy --enableDeepcBridge=true --useInputSchedule=false --deepcBridgeDir=data/output/deepc_bridge_smoke_20260507_01/bridge --deepcPastHorizon=3 --deepcFutureHorizon=2 --deepcResponseTimeout=20 --simTime=15 --cooldown=1 --maxVehicles=10 --kpiCsv=data/output/deepc_bridge_smoke_20260507_01/kpi_timeseries.csv --cbrCsv=data/output/deepc_bridge_smoke_20260507_01/cbr_timeseries.csv"
+```
+
+Smoke-test result:
+
+- ns-3 completed normally.
+- 47 bridge responses were applied.
+- `applied_controls.csv` confirms controller outputs were applied:
+  `tx_power_dbm=16`, `beacon_interval_s=0.12`.
+- Existing Hankel artifacts in `data/output/deepc_open_loop_250veh/` were not
+  overwritten.
+
+Next step:
+
+- Replace the dummy controller with a MATLAB/YALMIP process that reads the same
+  request JSON files and writes the same response JSON schema.
