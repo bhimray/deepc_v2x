@@ -402,3 +402,56 @@ Next step:
 
 - Replace the dummy controller with a MATLAB/YALMIP process that reads the same
   request JSON files and writes the same response JSON schema.
+
+## MATLAB/YALMIP DeePC File Controller
+
+Goal:
+
+- Add a MATLAB controller that can replace the dummy bridge controller without
+  changing ns-3.
+- Keep the same bridge schema:
+  - read `bridge/requests/request_XXXXXX.json`
+  - write `bridge/responses/response_XXXXXX.json`
+
+Implemented:
+
+- Added `scripts/export_deepc_matlab_data.py`.
+  - Exports `hankel_train_normalized.npz`, `dataset_summary.json`, and
+    `scaler.json` to MATLAB `.mat` format.
+  - Output: `data/output/deepc_open_loop_250veh/matlab_deepc_data.mat`.
+- Added `matlab/matlab_deepc_file_controller.m`.
+  - Loads the exported Hankel matrices once.
+  - Watches request JSON files.
+  - Solves classical Hankel DeePC in YALMIP with decision variable `g`.
+  - Writes response JSON containing `tx_power_dbm`, `beacon_interval_s`,
+    `success`, `objective`, `solve_time_s`, and `solver_status`.
+  - Supports shorter smoke-test horizons by slicing the exported
+    `Tini=20`, `N=10` Hankel blocks.
+
+Validation:
+
+```bash
+./v2x_env/bin/python -m py_compile scripts/export_deepc_matlab_data.py
+./v2x_env/bin/python scripts/export_deepc_matlab_data.py
+./v2x_env/bin/python -c "from scipy.io import loadmat; m=loadmat('data/output/deepc_open_loop_250veh/matlab_deepc_data.mat'); print(m['Up'].shape, m['Uf'].shape)"
+```
+
+Validation result:
+
+- `.mat` file was generated.
+- Reloaded matrix shapes are `Up=(40,3451)`, `Uf=(20,3451)`.
+
+Not run yet:
+
+- MATLAB/YALMIP execution, because MATLAB is available on Windows, not inside
+  this Linux workspace.
+
+Windows MATLAB command template:
+
+```matlab
+matlab_deepc_file_controller( ...
+    'BridgeDir', 'C:\Users\<you>\deepc_bridge_run01\bridge', ...
+    'DataMat', 'C:\Users\<you>\matlab_deepc_data.mat', ...
+    'YalmipDir', 'C:\tools\YALMIP', ...
+    'Solver', 'quadprog')
+```
