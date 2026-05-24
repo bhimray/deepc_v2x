@@ -40,11 +40,18 @@ def load_optional_csv(path: Path) -> pd.DataFrame | None:
     return pd.read_csv(path)
 
 
+def add_prr_alias(kpi: pd.DataFrame) -> pd.DataFrame:
+    if "prr_awareness" not in kpi and "prr_150m" in kpi:
+        kpi = kpi.copy()
+        kpi["prr_awareness"] = kpi["prr_150m"]
+    return kpi
+
+
 def metrics(kpi: pd.DataFrame, applied: pd.DataFrame | None, timing: pd.DataFrame | None) -> dict:
     result = {
         "rows": int(len(kpi)),
         "time_range_s": [float(kpi["time_s"].min()), float(kpi["time_s"].max())],
-        "mean_prr_150m": float(kpi["prr_150m"].mean()),
+        "mean_prr_awareness": float(kpi["prr_awareness"].mean()),
         "mean_pir_s": float(kpi["pir_s"].mean()),
         "mean_cbr": float(kpi["cbr"].mean()),
         "cbr_gt_0p6_rate": float((kpi["cbr"] > 0.6).mean()),
@@ -73,8 +80,8 @@ def metrics(kpi: pd.DataFrame, applied: pd.DataFrame | None, timing: pd.DataFram
 
 def plot_kpis(kpi: pd.DataFrame, out_dir: Path) -> None:
     fig, axes = plt.subplots(4, 1, figsize=(11, 9), sharex=True)
-    axes[0].plot(kpi["time_s"], kpi["prr_150m"], color="tab:green")
-    axes[0].set_ylabel("PRR 150m")
+    axes[0].plot(kpi["time_s"], kpi["prr_awareness"], color="tab:green")
+    axes[0].set_ylabel("PRR awareness")
     axes[0].set_ylim(-0.03, 1.03)
     axes[0].grid(alpha=0.3)
 
@@ -158,7 +165,7 @@ def main() -> None:
     kpi_path = run_dir / "kpi_timeseries.csv"
     if not kpi_path.exists():
         raise FileNotFoundError(f"Missing KPI file: {kpi_path}")
-    kpi = pd.read_csv(kpi_path)
+    kpi = add_prr_alias(pd.read_csv(kpi_path))
     applied = load_optional_csv(run_dir / "applied_controls.csv")
     timing = load_optional_csv(run_dir / "controller_solve_times.csv")
 

@@ -63,6 +63,20 @@ def newest_kpi_csv() -> Path:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def add_prr_alias(kpi: pd.DataFrame) -> pd.DataFrame:
+    if "prr_awareness" not in kpi and "prr_150m" in kpi:
+        kpi = kpi.copy()
+        kpi["prr_awareness"] = kpi["prr_150m"]
+    return kpi
+
+
+def add_eligible_alias(tx: pd.DataFrame) -> pd.DataFrame:
+    if "eligible_rx_count_awareness" not in tx and "eligible_rx_count_150m" in tx:
+        tx = tx.copy()
+        tx["eligible_rx_count_awareness"] = tx["eligible_rx_count_150m"]
+    return tx
+
+
 def log_paths(kpi_path: Path) -> tuple[Path, Path]:
     stem = kpi_path.with_suffix("")
     return (
@@ -120,8 +134,8 @@ def main() -> None:
         if not path.exists():
             raise FileNotFoundError(path)
 
-    kpi = pd.read_csv(kpi_path)
-    tx = pd.read_csv(tx_path)
+    kpi = add_prr_alias(pd.read_csv(kpi_path))
+    tx = add_eligible_alias(pd.read_csv(tx_path))
     rx = pd.read_csv(rx_path)
 
     require_columns(
@@ -129,7 +143,7 @@ def main() -> None:
         kpi_path,
         [
             "time_s",
-            "prr_150m",
+            "prr_awareness",
             "pir_s",
             "beacon_interval_s",
             "active_vehicle_count_core",
@@ -140,7 +154,7 @@ def main() -> None:
             "sensing_exclusion_ratio",
         ],
     )
-    require_columns(tx, tx_path, ["time_s", "eligible_rx_count_150m"])
+    require_columns(tx, tx_path, ["time_s", "eligible_rx_count_awareness"])
     require_columns(
         rx,
         rx_path,
@@ -179,7 +193,7 @@ def main() -> None:
     # =========================
     # 1. GLOBAL PRR VALIDATION
     # =========================
-    denominator = tx_eval["eligible_rx_count_150m"].sum()
+    denominator = tx_eval["eligible_rx_count_awareness"].sum()
     numerator = unique_rx_count(rx_eval[rx_eval["distance_m"] <= awareness_range])
     prr_raw = numerator / denominator if denominator else 0.0
 
@@ -197,7 +211,7 @@ def main() -> None:
             f"{metadata.get('core_max_m', metadata.get('core_x_max_m', 'n/a'))} m"
         )
     print(f"PRR from raw logs    : {prr_raw:.6f}")
-    print(f"Mean PRR KPI samples : {kpi_eval['prr_150m'].mean():.6f}")
+    print(f"Mean PRR KPI samples : {kpi_eval['prr_awareness'].mean():.6f}")
 
     # =========================
     # 2. TIME-WINDOW PRR VALIDATION
@@ -215,7 +229,7 @@ def main() -> None:
         tx_w = tx_eval[(tx_eval["time_s"] >= t0) & (tx_eval["time_s"] <= t1)]
         rx_w = rx_eval[(rx_eval["time_s"] >= t0) & (rx_eval["time_s"] <= t1)]
 
-        denom = tx_w["eligible_rx_count_150m"].sum()
+        denom = tx_w["eligible_rx_count_awareness"].sum()
         num = unique_rx_count(rx_w[rx_w["distance_m"] <= awareness_range])
 
         if denom > 0:
@@ -224,7 +238,7 @@ def main() -> None:
 
     plt.figure()
     plt.plot(time_centers, prr_time, label="PRR recomputed from raw logs", linewidth=2)
-    plt.plot(kpi_eval["time_s"], kpi_eval["prr_150m"], "--", label="PRR from KPI logger")
+    plt.plot(kpi_eval["time_s"], kpi_eval["prr_awareness"], "--", label="PRR from KPI logger")
     plt.xlabel("Time (s)")
     plt.ylabel("PRR")
     plt.title("PRR validation")

@@ -361,10 +361,12 @@ def set_initial_state(solver: AcadosOcpSolver, x0: np.ndarray) -> None:
 def compute_metrics(result: pd.DataFrame) -> dict:
     return {
         "rollout_rows": int(len(result)),
-        "mean_deepc_prr_150m": float(result["deepc_prr_150m"].mean()),
+        "mean_deepc_prr_awareness": float(result["deepc_prr_awareness"].mean()),
         "mean_deepc_pir_s": float(result["deepc_pir_s"].mean()),
         "mean_deepc_cbr": float(result["deepc_cbr"].mean()),
-        "mean_measured_open_loop_prr_150m": float(result["measured_open_loop_prr_150m"].mean()),
+        "mean_measured_open_loop_prr_awareness": float(
+            result["measured_open_loop_prr_awareness"].mean()
+        ),
         "mean_measured_open_loop_pir_s": float(result["measured_open_loop_pir_s"].mean()),
         "mean_measured_open_loop_cbr": float(result["measured_open_loop_cbr"].mean()),
         "deepc_cbr_gt_0p6_rate": float((result["deepc_cbr"] > 0.6).mean()),
@@ -391,10 +393,10 @@ def plot_results(result: pd.DataFrame, out_dir: Path) -> None:
     plots.mkdir(parents=True, exist_ok=True)
 
     fig, axes = plt.subplots(4, 1, figsize=(11, 9), sharex=True)
-    axes[0].plot(result["time_s"], result["deepc_prr_150m"], label="acados DeePC surrogate")
+    axes[0].plot(result["time_s"], result["deepc_prr_awareness"], label="acados DeePC surrogate")
     axes[0].plot(
         result["time_s"],
-        result["measured_open_loop_prr_150m"],
+        result["measured_open_loop_prr_awareness"],
         "--",
         label="measured open-loop",
     )
@@ -521,10 +523,10 @@ def main() -> None:
         "time_s",
         "deepc_tx_power_dbm",
         "deepc_beacon_interval_s",
-        "deepc_prr_150m",
+        "deepc_prr_awareness",
         "deepc_pir_s",
         "deepc_cbr",
-        "measured_open_loop_prr_150m",
+        "measured_open_loop_prr_awareness",
         "measured_open_loop_pir_s",
         "measured_open_loop_cbr",
         *context_cols,

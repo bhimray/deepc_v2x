@@ -233,7 +233,7 @@ def denormalize_outputs(y_norm: np.ndarray, output_cols: list[str], scaler: dict
 def clip_physical(y: np.ndarray, output_cols: list[str]) -> np.ndarray:
     out = y.copy()
     for j, col in enumerate(output_cols):
-        if col in {"prr_150m", "cbr", "sensing_exclusion_ratio"}:
+        if col in {"prr_awareness", "prr_150m", "cbr", "sensing_exclusion_ratio"}:
             out[:, :, j] = np.clip(out[:, :, j], 0.0, 1.0)
         elif col == "pir_s":
             out[:, :, j] = np.maximum(out[:, :, j], 0.0)

@@ -10,6 +10,13 @@ OUTPUT_DIR = Path("data/output")
 WARMUP_S = 5.0
 
 
+def add_prr_alias(kpi: pd.DataFrame) -> pd.DataFrame:
+    if "prr_awareness" not in kpi and "prr_150m" in kpi:
+        kpi = kpi.copy()
+        kpi["prr_awareness"] = kpi["prr_150m"]
+    return kpi
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate publication sanity plots for PHY CBR and sensing diagnostics."
@@ -213,7 +220,7 @@ def main() -> None:
     frames = []
     rx_frames = []
     for path in kpi_paths:
-        df = pd.read_csv(path)
+        df = add_prr_alias(pd.read_csv(path))
         require_columns(
             df,
             path,
@@ -224,7 +231,7 @@ def main() -> None:
                 "density_veh_per_km_core",
                 "mean_neighbors_150m",
                 "mean_neighbors_300m",
-                "prr_150m",
+                "prr_awareness",
                 "pir_s",
                 "cbr",
                 "sensing_exclusion_ratio",
@@ -357,9 +364,9 @@ def main() -> None:
     scatter_with_trend(
         kpi,
         "density_veh_per_km_core",
-        "prr_150m",
+        "prr_awareness",
         "Measured density in core (veh/km)",
-        "PRR within 150 m",
+        "PRR within awareness range",
         "PRR vs measured density",
         args.plots_dir / "prr_vs_measured_density.png",
     )
@@ -367,9 +374,9 @@ def main() -> None:
     scatter_with_trend(
         kpi,
         "mean_neighbors_150m",
-        "prr_150m",
+        "prr_awareness",
         "Mean neighbors within 150 m",
-        "PRR within 150 m",
+        "PRR within awareness range",
         "PRR vs local neighbor count",
         args.plots_dir / "prr_vs_mean_neighbors_150m.png",
     )
@@ -377,9 +384,9 @@ def main() -> None:
     scatter_with_trend(
         kpi,
         "cbr",
-        "prr_150m",
+        "prr_awareness",
         "PHY CBR",
-        "PRR within 150 m",
+        "PRR within awareness range",
         "PRR vs PHY CBR",
         args.plots_dir / "prr_vs_cbr.png",
     )
@@ -396,9 +403,9 @@ def main() -> None:
 
     scatter_with_trend(
         kpi,
-        "prr_150m",
+        "prr_awareness",
         "pir_s",
-        "PRR within 150 m",
+        "PRR within awareness range",
         "Mean PIR (s)",
         "Mean PIR vs PRR",
         args.plots_dir / "pir_vs_prr.png",
@@ -407,9 +414,9 @@ def main() -> None:
     scatter_with_trend(
         kpi,
         "sensing_exclusion_ratio",
-        "prr_150m",
+        "prr_awareness",
         "Sensing exclusion ratio",
-        "PRR within 150 m",
+        "PRR within awareness range",
         "PRR vs sensing exclusion ratio",
         args.plots_dir / "prr_vs_sensing_exclusion.png",
     )
@@ -418,10 +425,10 @@ def main() -> None:
         kpi,
         "density_veh_per_km_core",
         "cbr",
-        "prr_150m",
+        "prr_awareness",
         "Measured density in core (veh/km)",
         "PHY CBR",
-        "PRR within 150 m",
+        "PRR within awareness range",
         "PRR vs PHY CBR vs measured density",
         args.plots_dir / "prr_cbr_density_3d.png",
     )

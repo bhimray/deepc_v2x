@@ -22,8 +22,8 @@ MAX_POSITION_JUMP_M = 20.0
 MAX_VEHICLES = 100  # default cap; override with --max-vehicles
 
 # TIME WINDOW (VERY IMPORTANT)
-TIME_START = 100.0
-TIME_END = 400.0
+TIME_START = 0.0
+TIME_END = 600.0
 
 # MAINLINE LANES (adjust after inspection)
 MAINLINE_LANES = {2, 3, 4, 5}

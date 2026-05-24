@@ -15,7 +15,7 @@ DEFAULT_KPI = Path("data/output/kpi_timeseries_10min_250veh_run01.csv")
 DEFAULT_OUT_DIR = Path("data/output/deepc_open_loop_250veh")
 
 INPUT_COLS = ["tx_power_dbm", "beacon_interval_s"]
-OUTPUT_COLS = ["prr_150m", "pir_s", "cbr"]
+OUTPUT_COLS = ["prr_awareness", "pir_s", "cbr"]
 CONTEXT_COLS = [
     "active_vehicle_count_core",
     "density_veh_per_km_core",
@@ -188,8 +188,11 @@ def finite_checks(df: pd.DataFrame, columns: list[str]) -> dict:
     }
     if "cbr" in df:
         checks["cbr_range"] = [float(df["cbr"].min()), float(df["cbr"].max())]
-    if "prr_150m" in df:
-        checks["prr_150m_range"] = [float(df["prr_150m"].min()), float(df["prr_150m"].max())]
+    if "prr_awareness" in df:
+        checks["prr_awareness_range"] = [
+            float(df["prr_awareness"].min()),
+            float(df["prr_awareness"].max()),
+        ]
     if "beacon_interval_s" in df:
         checks["beacon_interval_s_range"] = [
             float(df["beacon_interval_s"].min()),
@@ -214,6 +217,8 @@ def main() -> None:
         eval_end = float(metadata["evaluation_end_s"])
 
     raw = pd.read_csv(args.kpi_csv)
+    if "prr_awareness" not in raw and "prr_150m" in raw:
+        raw["prr_awareness"] = raw["prr_150m"]
     require_columns(raw, args.kpi_csv, ["time_s", *all_model_cols])
 
     clean = raw.copy()
@@ -227,7 +232,9 @@ def main() -> None:
         raise ValueError("No rows remain after filtering and dropping NaNs")
     if "cbr" in clean and ((clean["cbr"] < 0.0) | (clean["cbr"] > 1.0)).any():
         raise ValueError("CBR values must be in [0, 1]")
-    if "prr_150m" in clean and ((clean["prr_150m"] < 0.0) | (clean["prr_150m"] > 1.0)).any():
+    if "prr_awareness" in clean and (
+        (clean["prr_awareness"] < 0.0) | (clean["prr_awareness"] > 1.0)
+    ).any():
         raise ValueError("PRR values must be in [0, 1]")
     if "beacon_interval_s" in clean and (clean["beacon_interval_s"] <= 0.0).any():
         raise ValueError("Beacon interval must be positive")
