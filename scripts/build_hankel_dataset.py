@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_KPI = Path("data/output/kpi_timeseries_10min_250veh_run01.csv")
+DEFAULT_KPI = Path("data/output/deepc_open_loop_250veh/kpi_timeseries.csv")
 DEFAULT_OUT_DIR = Path("data/output/deepc_open_loop_250veh")
 
 INPUT_COLS = ["tx_power_dbm", "beacon_interval_s"]
