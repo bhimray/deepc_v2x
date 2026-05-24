@@ -11,7 +11,7 @@ function matlab_deepc_file_controller(varargin)
 % matching BridgeDir\responses\response_XXXXXX.json. It uses the classical
 % Hankel DeePC decision variable g:
 %
-%   Up*g ~= u_ini, Yp*g ~= y_ini, Dp*g ~= d_ini, Df*g ~= d_future
+%   Up*g = u_ini, Yp*g = y_ini
 %   u_future = Uf*g, y_future = Yf*g
 
 p = inputParser;
@@ -28,6 +28,12 @@ addParameter(p, 'TargetPir', 0.10);
 addParameter(p, 'TargetCbr', 0.35);
 addParameter(p, 'TargetPowerDbm', 16.0);
 addParameter(p, 'TargetBeaconIntervalS', 0.10);
+addParameter(p, 'MinPrr', 0.0);
+addParameter(p, 'MaxPrr', 1.0);
+addParameter(p, 'MinPir', 0.0);
+addParameter(p, 'MaxPir', Inf);
+addParameter(p, 'MinCbr', 0.0);
+addParameter(p, 'MaxCbr', 1.0);
 addParameter(p, 'WeightPrr', 40.0);
 addParameter(p, 'WeightPir', 3.0);
 addParameter(p, 'WeightCbr', 8.0);
@@ -39,12 +45,12 @@ addParameter(p, 'LambdaIniU', 2.0e3);
 addParameter(p, 'LambdaIniY', 2.0e3);
 addParameter(p, 'LambdaIniD', 4.0e2);
 addParameter(p, 'LambdaFutureD', 4.0e2);
+addParameter(p, 'LambdaY', 1.0e-3);
 addParameter(p, 'LambdaG', 1.0e-3);
 addParameter(p, 'MinPowerDbm', 10.0);
 addParameter(p, 'MaxPowerDbm', 23.0);
 addParameter(p, 'MinBeaconIntervalS', 0.05);
 addParameter(p, 'MaxBeaconIntervalS', 0.50);
-addParameter(p, 'UseSumToOne', true);
 parse(p, varargin{:});
 cfg = p.Results;
 
@@ -117,13 +123,14 @@ while true
         payload.solver_status = solverStatus;
         payload.controller = 'matlab_yalmip_classical_deepc';
         write_json_atomic(responsePath, payload);
+        assert(exist(responsePath, 'file') == 2, 'Response was not written: %s', responsePath);
 
         processed(requestName) = true;
         completed = completed + 1;
         didWork = true;
         lastActivity = tic;
-        fprintf('step=%d success=%d u=[%.3f, %.3f] solve=%.3fs\n', ...
-            req.step, success, txPowerDbm, beaconIntervalS, solveTime);
+        fprintf('step=%d success=%d u=[%.3f, %.3f] solve=%.3fs response=%s\n', ...
+            req.step, success, txPowerDbm, beaconIntervalS, solveTime, responsePath);
 
         if cfg.MaxSteps > 0 && completed >= cfg.MaxSteps
             return;
@@ -142,65 +149,82 @@ end
 function sol = solve_request(req, data, cfg)
 uIni = as_column(req.u_ini);
 yIni = as_column(req.y_ini);
-dIni = as_column(req.d_ini);
-dFuture = as_column(req.d_future);
 previousU = as_column(req.previous_u);
 
 nu = numel(previousU);
 ny = 3;
 nd = 5;
 N = req.future_horizon;
+
 H = prepare_hankel_for_request(data, req, nu, ny, nd);
 
 uIniNorm = normalize_blocks(uIni, data.input_mean, data.input_std, nu);
 yIniNorm = normalize_blocks(yIni, data.output_mean, data.output_std, ny);
-dIniNorm = normalize_blocks(dIni, data.context_mean, data.context_std, nd);
-dFutureNorm = normalize_blocks(dFuture, data.context_mean, data.context_std, nd);
 previousUNorm = normalize_blocks(previousU, data.input_mean, data.input_std, nu);
 
-idx = select_hankel_columns(H, uIniNorm, yIniNorm, dIniNorm, dFutureNorm, cfg.MaxHankelCols);
+% Use all Hankel columns or selected local columns
+idx = 1:size(H.Up, 2);
+if cfg.MaxHankelCols > 0 && cfg.MaxHankelCols < size(H.Up, 2)
+    score = sum((H.Up - uIniNorm).^2, 1) + ...
+            sum((H.Yp - yIniNorm).^2, 1);
+    [~, order] = sort(score, 'ascend');
+    idx = order(1:cfg.MaxHankelCols);
+end
+
 Up = H.Up(:, idx);
 Uf = H.Uf(:, idx);
 Yp = H.Yp(:, idx);
 Yf = H.Yf(:, idx);
-Dp = H.Dp(:, idx);
-Df = H.Df(:, idx);
+
 nG = numel(idx);
 
 g = sdpvar(nG, 1);
-uFuture = Uf * g;
-yFuture = Yf * g;
+uFuture = sdpvar(N * nu, 1);
+yFuture = sdpvar(N * ny, 1);
 
+% Reference output only
 yRefPhys = repmat([cfg.TargetPrr; cfg.TargetPir; cfg.TargetCbr], N, 1);
-uRefPhys = repmat([cfg.TargetPowerDbm; cfg.TargetBeaconIntervalS], N, 1);
 yRef = normalize_blocks(yRefPhys, data.output_mean, data.output_std, ny);
-uRef = normalize_blocks(uRefPhys, data.input_mean, data.input_std, nu);
 
+% Weights
 Q = repmat([cfg.WeightPrr; cfg.WeightPir; cfg.WeightCbr], N, 1);
 R = repmat([cfg.WeightPower; cfg.WeightBeaconInterval], N, 1);
-DuW = repmat([cfg.WeightDeltaPower; cfg.WeightDeltaBeaconInterval], N, 1);
 
+% Input bounds
 inputLb = normalize_blocks([cfg.MinPowerDbm; cfg.MinBeaconIntervalS], ...
     data.input_mean, data.input_std, nu);
+
 inputUb = normalize_blocks([cfg.MaxPowerDbm; cfg.MaxBeaconIntervalS], ...
     data.input_mean, data.input_std, nu);
 
-constraints = [repmat(inputLb, N, 1) <= uFuture <= repmat(inputUb, N, 1)];
-if cfg.UseSumToOne
-    constraints = [constraints, sum(g) == 1];
-end
+% Output bounds
+outputLb = normalize_blocks([cfg.MinPrr; cfg.MinPir; cfg.MinCbr], ...
+    data.output_mean, data.output_std, ny);
 
-du = [uFuture(1:nu) - previousUNorm; uFuture(nu+1:end) - uFuture(1:end-nu)];
+outputUb = normalize_blocks([cfg.MaxPrr; cfg.MaxPir; cfg.MaxCbr], ...
+    data.output_mean, data.output_std, ny);
 
+constraints = [];
+
+% Classical DeePC past trajectory matching
+constraints = [constraints, Up * g == uIniNorm];
+constraints = [constraints, Yp * g == yIniNorm];
+
+% Classical DeePC future trajectory matching
+constraints = [constraints, Uf * g == uFuture];
+constraints = [constraints, Yf * g == yFuture];
+
+% Future input and output constraints
+constraints = [constraints, repmat(inputLb, N, 1) <= uFuture <= repmat(inputUb, N, 1)];
+constraints = [constraints, repmat(outputLb, N, 1) <= yFuture <= repmat(outputUb, N, 1)];
+
+% Classical DeePC objective:
+% ||u||_R^2 + ||y-r||_Q^2 + lambda_y ||y||_2^2 + lambda_g ||g||_2^2
 objective = ...
+    sum(R .* (uFuture).^2) + ...
     sum(Q .* (yFuture - yRef).^2) + ...
-    sum(R .* (uFuture - uRef).^2) + ...
-    cfg.LambdaIniU * sumsqr(Up * g - uIniNorm) + ...
-    cfg.LambdaIniY * sumsqr(Yp * g - yIniNorm) + ...
-    cfg.LambdaIniD * sumsqr(Dp * g - dIniNorm) + ...
-    cfg.LambdaFutureD * sumsqr(Df * g - dFutureNorm) + ...
-    sum(DuW .* du.^2) + ...
-    cfg.LambdaG * sumsqr(g);
+    cfg.LambdaY * square_sum(yFuture) + ...
+    cfg.LambdaG * square_sum(g);
 
 ops = sdpsettings('solver', cfg.Solver, 'verbose', 0);
 diagnostics = optimize(constraints, objective, ops);
@@ -245,22 +269,12 @@ H.Dp = data.Dp(pastD, :);
 H.Df = data.Df(futureD, :);
 end
 
-function idx = select_hankel_columns(H, uIni, yIni, dIni, dFuture, maxCols)
-nCols = size(H.Up, 2);
-if maxCols <= 0 || maxCols >= nCols
-    idx = 1:nCols;
-    return;
-end
-score = sum((H.Up - uIni).^2, 1) + ...
-    sum((H.Yp - yIni).^2, 1) + ...
-    0.25 * sum((H.Dp - dIni).^2, 1) + ...
-    0.25 * sum((H.Df - dFuture).^2, 1);
-[~, order] = sort(score, 'ascend');
-idx = order(1:maxCols);
-end
-
 function x = as_column(value)
 x = double(value(:));
+end
+
+function y = square_sum(x)
+y = sum(x(:).^2);
 end
 
 function normValues = normalize_blocks(values, meanValues, stdValues, blockSize)

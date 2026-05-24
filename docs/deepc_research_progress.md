@@ -35,7 +35,7 @@ Observed dataset facts:
 - vehicle count: 250
 - input schedule: PRBS over Tx power and beacon interval
 - DeePC-ready inputs: `tx_power_dbm`, `beacon_interval_s`
-- DeePC-ready outputs: `prr_150m`, `pir_s`, `cbr`
+- DeePC-ready outputs: `prr_awareness`, `pir_s`, `cbr`
 - traffic/context variables: `active_vehicle_count_core`,
   `density_veh_per_km_core`, `mean_neighbors_150m`,
   `mean_neighbors_300m`, `sensing_exclusion_ratio`

@@ -1,0 +1,374 @@
+\documentclass[aspectratio=1610]{beamer}
+
+\title{Closed-Loop DeePC Progress}
+\date{May 2026}
+\author{Aaron Wolf (Northwestern University)}
+
+% Theme options -- combine any of these in a single \usetheme call:
+%   \usetheme[
+%     pattern=triangle,
+%     color=nudarkblue,
+%     font=poppins,
+%     numbering=progressbar,
+%     sectionpage=on,
+%     agendastyle=pattern
+%   ]{wildcat}
+\usetheme{wildcat}
+
+\IfFileExists{logo-northwestern.pdf}{%
+  \titlegraphic{\includegraphics[scale=0.25]{logo-northwestern.pdf}}%
+}{}
+
+\begin{document}
+
+% ============================================================
+\section{Closed-Loop DeePC Progress}
+
+\begin{frame}{ns-3 Side: Plant Parameters}
+\[
+\text{ns-3} \equiv \text{NR-V2X plant}
+\]
+
+\begin{block}{Scenario}
+\[
+T_{\mathrm{sim}}=60s,\quad \Delta t=0.1s,\quad N_{\mathrm{veh}}=10
+\]
+\[
+t_{\mathrm{eval}}=[10,55]s
+\]
+\end{block}
+
+\begin{block}{Radio / V2X}
+\[
+f_c=5.9\text{ GHz},\quad BW=10\text{ MHz},\quad MCS=6
+\]
+\[
+P_{\mathrm{tx},0}=20\text{ dBm},\quad T_{b,0}=0.1s
+\]
+\[
+R_{\mathrm{aware}}=300m,\quad W_{\mathrm{KPI}}=1s
+\]
+\end{block}
+\end{frame}
+
+% ============================================================
+
+\begin{frame}{ns-3 Side: DeePC Signals}
+\[
+u_k =
+\begin{bmatrix}
+P_{\mathrm{tx},k}\\
+T_{b,k}
+\end{bmatrix}
+\]
+
+\[
+y_k =
+\begin{bmatrix}
+PRR_{\mathrm{aware},k}\\
+PIR_k\\
+CBR_k
+\end{bmatrix}
+\]
+
+\[
+d_k =
+\begin{bmatrix}
+N_{\mathrm{active}}\\
+\rho_{\mathrm{veh/km}}\\
+\bar n_{150}\\
+\bar n_{300}\\
+r_{\mathrm{sensing}}
+\end{bmatrix}
+\]
+
+\begin{exampleblock}{Current controller use}
+\[
+u_k,y_k \rightarrow \text{hard DeePC trajectory matching}
+\qquad
+d_k \rightarrow \text{logged / available context}
+\]
+\end{exampleblock}
+\end{frame}
+
+% ============================================================
+
+\begin{frame}{MATLAB Side: DeePC Model}
+\[
+\text{MATLAB} \equiv \text{DeePC optimizer}
+\]
+
+\[
+\begin{aligned}
+U_p g &= u_{\mathrm{ini}} \\
+Y_p g &= y_{\mathrm{ini}} \\
+U_f g &= u_f \\
+Y_f g &= y_f
+\end{aligned}
+\]
+
+\[
+u_{\mathrm{future}} \equiv u_f
+\qquad
+y_{\mathrm{future}} \equiv y_f
+\]
+
+\begin{block}{Current simplification}
+\[
+D_p g=d_{\mathrm{ini}}
+\quad\text{and}\quad
+D_f g=d_{\mathrm{future}}
+\]
+are not enforced in the current MATLAB objective/constraints.
+\end{block}
+
+\begin{block}{Horizons}
+\[
+T_{\mathrm{ini}}=\text{past samples}
+\qquad
+N=\text{future samples}
+\]
+Example run:
+\[
+H=50,\quad T_{\mathrm{ini}}=8,\quad N=2
+\]
+\end{block}
+\end{frame}
+
+% ============================================================
+
+\begin{frame}{MATLAB Side: Optimization}
+\[
+\begin{aligned}
+\min_g \quad
+J(g)
+&=
+\|u_f\|_R^2
++
+\|y_f-y_{\mathrm{ref}}\|_Q^2
++
+\lambda_y\|y_f\|_2^2
++
+\lambda_g\|g\|_2^2
+\\[0.2cm]
+\text{s.t.}\quad
+U_p g &= u_{\mathrm{ini}} \\
+Y_p g &= y_{\mathrm{ini}} \\
+U_f g &= u_f \\
+Y_f g &= y_f \\
+u_{\min} &\le U_f g \le u_{\max} \\
+y_{\min} &\le Y_f g \le y_{\max}
+\end{aligned}
+\]
+
+\begin{block}{Expanded objective}
+\[
+J(g)
+=
+\sum_{k=1}^{N} R_k u_{f,k}^2
++
+\sum_{k=1}^{N} Q_k
+\left(y_{f,k}-y_{\mathrm{ref},k}\right)^2
++
+\lambda_y y_f^\top y_f
++
+\lambda_g g^\top g
+\]
+\end{block}
+\end{frame}
+
+% ============================================================
+
+\begin{frame}{MATLAB Side: Targets and Bounds}
+\begin{block}{Output target}
+\[
+y_{\mathrm{ref}} =
+\begin{bmatrix}
+0.95\\
+0.10\\
+0.35
+\end{bmatrix}
+=
+\begin{bmatrix}
+PRR^\star\\
+PIR^\star\\
+CBR^\star
+\end{bmatrix}
+\]
+\end{block}
+
+\begin{block}{Control effort penalty}
+\[
+u_{\mathrm{ref}}\ \text{is not used in the current objective.}
+\]
+\[
+\|u_f\|_R^2
+\text{ penalizes large transmit power and beacon interval values.}
+\]
+\end{block}
+
+\begin{alertblock}{Input bounds}
+\[
+10 \le P_{\mathrm{tx}} \le 23
+\qquad
+0.05 \le T_b \le 0.50
+\]
+\end{alertblock}
+
+\begin{alertblock}{Output bounds}
+\[
+0 \le PRR_{\mathrm{aware}} \le 1
+\qquad
+0 \le PIR
+\qquad
+0 \le CBR \le 1
+\]
+\end{alertblock}
+\end{frame}
+
+% ============================================================
+
+\begin{frame}{Objective: What Changed}
+\begin{block}{Removed from the current MATLAB solve}
+\[
+\|u_f-u_{\mathrm{ref}}\|_R^2,\quad
+\lambda_{\mathrm{ini},u}\|U_p g-u_{\mathrm{ini}}\|_2^2,\quad
+\lambda_{\mathrm{ini},y}\|Y_p g-y_{\mathrm{ini}}\|_2^2
+\]
+\[
+\lambda_{\mathrm{ini},d}\|D_p g-d_{\mathrm{ini}}\|_2^2,\quad
+\lambda_{\mathrm{future},d}\|D_f g-d_{\mathrm{future}}\|_2^2,\quad
+\|\Delta u\|_{W_{\Delta u}}^2
+\]
+\end{block}
+
+\begin{exampleblock}{Added as hard constraints}
+\[
+U_p g=u_{\mathrm{ini}},
+\qquad
+Y_p g=y_{\mathrm{ini}},
+\qquad
+U_f g=u_f,
+\qquad
+Y_f g=y_f
+\]
+\[
+u_{\min}\le u_f\le u_{\max},
+\qquad
+y_{\min}\le y_f\le y_{\max}
+\]
+\end{exampleblock}
+\end{frame}
+
+% ============================================================
+
+\begin{frame}{Connection: ns-3 $\leftrightarrow$ MATLAB}
+\[
+\boxed{\text{ns-3 writes request JSON}}
+\quad\Longrightarrow\quad
+\boxed{\text{MATLAB solves DeePC}}
+\quad\Longrightarrow\quad
+\boxed{\text{ns-3 reads response JSON}}
+\]
+
+\[
+\texttt{request\_k.json}:
+\quad
+u_{\mathrm{ini}},y_{\mathrm{ini}},d_{\mathrm{ini}},d_f,u_{k-1}
+\]
+
+\[
+\texttt{current MATLAB solve uses:}
+\quad
+u_{\mathrm{ini}},y_{\mathrm{ini}}
+\quad
+\text{and uses }u_{k-1}\text{ only as fallback.}
+\]
+
+\[
+\texttt{response\_k.json}:
+\quad
+P_{\mathrm{tx},k},T_{b,k},\text{success},t_{\mathrm{solve}}
+\]
+
+\begin{exampleblock}{Closed-loop step}
+\[
+\boxed{
+y_k,d_k
+\rightarrow
+\text{request}
+\rightarrow
+\text{DeePC}
+\rightarrow
+u_k
+\rightarrow
+\text{ns-3}
+\rightarrow
+y_{k+1}
+}
+\]
+\end{exampleblock}
+
+\[
+\text{Only first } u_k \text{ is applied; then solve again.}
+\]
+\end{frame}
+
+% ============================================================
+
+\begin{frame}{Results}
+\[
+\text{Progress: ns-3 KPI logger + JSON bridge + MATLAB DeePC solver are connected.}
+\]
+\[
+\text{Current run: } \overline{PRR}_{\mathrm{aware}}=0.497,\quad
+\overline{PIR}=0.211s,\quad
+\overline{CBR}=0.112
+\]
+\end{frame}
+
+\begin{frame}{Closed-Loop ns-3--MATLAB DeePC}
+    \centering
+    \IfFileExists{controls.png}{%
+      \includegraphics[width=0.92\textwidth]{controls.png}%
+    }{%
+      \[
+      \texttt{controls.png}\ \text{not found}
+      \]
+    }
+\end{frame}
+
+\begin{frame}{Closed-Loop ns-3--MATLAB DeePC}
+    \centering
+    \IfFileExists{kpi_timeseries.png}{%
+      \includegraphics[width=0.72\textwidth]{kpi_timeseries.png}%
+    }{%
+      \[
+      \texttt{kpi\_timeseries.png}\ \text{not found}
+      \]
+    }
+\end{frame}
+
+\begin{frame}{References}
+\footnotesize
+\begin{thebibliography}{9}
+
+\bibitem{mannoni2019v2x}
+V. Mannoni, V. Berg, S. Sesia, and E. Perraud,
+``A comparison of the V2X communication systems: ITS-G5 and C-V2X,''
+in \emph{2019 IEEE 89th Vehicular Technology Conference (VTC2019-Spring)},
+Kuala Lumpur, Malaysia, Apr. 2019, pp. 1--5.
+
+\bibitem{bartoletti2021generation}
+S. Bartoletti, B. M. Masini, V. Martinez, I. Sarris, and A. Bazzi,
+``Impact of the generation interval on the performance of sidelink C-V2X autonomous mode,''
+\emph{IEEE Access}, vol. 9, pp. 35121--35135, Feb. 2021.
+
+\bibitem{mccarthy2021congestion}
+B. McCarthy and A. O'Driscoll,
+``Congestion control in the cellular-V2X sidelink,''
+\emph{arXiv preprint arXiv:2106.04871}, Jun. 2021.
+\end{thebibliography}
+\end{frame}
+
+\end{document}
