@@ -3,8 +3,8 @@
 
 Expected run folder contents:
   kpi_timeseries.csv
-  applied_controls.csv
-  controller_solve_times.csv
+  applied_controls.csv or bridge/applied_controls.csv
+  controller_solve_times.csv or bridge/controller_solve_times.csv
   bridge_requests/      optional
   bridge_responses/     optional
 """
@@ -29,15 +29,36 @@ import pandas as pd
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot a DeePC bridge run folder.")
-    parser.add_argument("run_dir", type=Path, help="Run output directory.")
+    parser.add_argument("run_dir", nargs="?", type=Path, help="Run output directory.")
+    parser.add_argument(
+        "--campaign-dir",
+        type=Path,
+        default=None,
+        help="Campaign root containing 02_runs/<method>/run_<id>.",
+    )
+    parser.add_argument("--method", default=None, help="Method folder under 02_runs.")
+    parser.add_argument("--run", default=None, help="Run number, e.g., 101 or run_101.")
     parser.add_argument("--out-dir", type=Path, default=None, help="Defaults to RUN_DIR/plots.")
     return parser.parse_args()
 
 
-def load_optional_csv(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    return pd.read_csv(path)
+def normalize_run_name(run: str) -> str:
+    return run if run.startswith("run_") else f"run_{int(run):03d}"
+
+
+def resolve_run_dir(args: argparse.Namespace) -> Path:
+    if args.run_dir is not None:
+        return args.run_dir
+    if args.campaign_dir is None or args.method is None or args.run is None:
+        raise ValueError("Provide RUN_DIR, or provide --campaign-dir, --method, and --run.")
+    return args.campaign_dir / "02_runs" / args.method / normalize_run_name(str(args.run))
+
+
+def load_optional_csv(paths: list[Path]) -> pd.DataFrame | None:
+    for path in paths:
+        if path.exists():
+            return pd.read_csv(path)
+    return None
 
 
 def add_prr_alias(kpi: pd.DataFrame) -> pd.DataFrame:
@@ -158,7 +179,7 @@ def plot_controller(timing: pd.DataFrame | None, out_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    run_dir = args.run_dir
+    run_dir = resolve_run_dir(args)
     out_dir = args.out_dir or run_dir / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -166,8 +187,10 @@ def main() -> None:
     if not kpi_path.exists():
         raise FileNotFoundError(f"Missing KPI file: {kpi_path}")
     kpi = add_prr_alias(pd.read_csv(kpi_path))
-    applied = load_optional_csv(run_dir / "applied_controls.csv")
-    timing = load_optional_csv(run_dir / "controller_solve_times.csv")
+    applied = load_optional_csv([run_dir / "applied_controls.csv", run_dir / "bridge" / "applied_controls.csv"])
+    timing = load_optional_csv(
+        [run_dir / "controller_solve_times.csv", run_dir / "bridge" / "controller_solve_times.csv"]
+    )
 
     plot_kpis(kpi, out_dir)
     plot_controls(kpi, applied, out_dir)

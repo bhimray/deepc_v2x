@@ -1,9 +1,10 @@
 /* -*-  Mode: C++; c-file-style: "gnu"; indent-tabs-mode:nil; -*- */
 /*
- * Open-loop PRBS dataset-generation driver for MATLAB/DeePC Hankel data.
+ * Open-loop NR-V2X experiment driver for MATLAB/DeePC data and baselines.
  *
- * This scratch program is intentionally for data generation only:
- * - PRBS input scheduling is enabled and drives Tx power / beacon interval.
+ * This scratch program is intentionally open-loop only:
+ * - PRBS input scheduling can drive Tx power / beacon interval for Hankel data.
+ * - Fixed Tx power / beacon interval can be used for open-loop sanity baselines.
  * - No MATLAB DeePC bridge is present in this file.
  * - Use nr_v2x_ngsim_deepc_closed_loop_deepc for closed-loop DeePC runs.
  */
@@ -1654,7 +1655,7 @@ main(int argc, char* argv[])
 {
     const auto __ns3_total_compute_start = std::chrono::steady_clock::now();
     // File paths
-    std::string mobilityCsv = "data/processed/ngsim_us101_10min_0p1s_250veh.csv";
+    std::string mobilityCsv = "data/processed/ngsim_us101_mainline_active20_250_densest_600s.csv";
     std::string inputCsv = "data/processed/prbs_schedule.csv";
     std::string kpiCsv = "data/output/deepc_open_loop_250veh/kpi_timeseries.csv";
     std::string cbrCsv = "data/output/deepc_open_loop_250veh/cbr_timeseries.csv";
@@ -1760,11 +1761,6 @@ main(int argc, char* argv[])
                     "warmup and cooldown must be non-negative");
     NS_ABORT_MSG_IF(warmupS + cooldownS >= simTimeSeconds,
                     "warmup + cooldown must be smaller than simTime");
-    NS_ABORT_MSG_IF(!useInputSchedule,
-                    "This scratch program is the PRBS dataset generator. "
-                    "Use --useInputSchedule=true, or use "
-                    "nr_v2x_ngsim_deepc_closed_loop_deepc for closed-loop DeePC.");
-
     RngSeedManager::SetSeed(seed);
     RngSeedManager::SetRun(run);
 

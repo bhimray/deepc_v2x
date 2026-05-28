@@ -26,6 +26,16 @@ def parse_args() -> argparse.Namespace:
         help="KPI CSV to validate. Defaults to the newest KPI CSV in data/output.",
     )
     parser.add_argument(
+        "--campaign-dir",
+        type=Path,
+        default=None,
+        help="Campaign root containing 02_runs/<method>/run_<id>/kpi_timeseries.csv.",
+    )
+    parser.add_argument("--method", default=None, help="Method folder under 02_runs.")
+    parser.add_argument("--run", default=None, help="Run number, e.g., 101 or run_101.")
+    parser.add_argument("--out-dir", type=Path, default=None, help="Directory for validation plots.")
+    parser.add_argument("--show", action="store_true", help="Show plots interactively.")
+    parser.add_argument(
         "--warmup",
         type=float,
         default=None,
@@ -50,6 +60,26 @@ def parse_args() -> argparse.Namespace:
         help=f"PRR validation window in seconds. Default: {KPI_WINDOW_S}",
     )
     return parser.parse_args()
+
+
+def normalize_run_name(run: str) -> str:
+    return run if run.startswith("run_") else f"run_{int(run):03d}"
+
+
+def resolve_kpi_csv(args: argparse.Namespace) -> Path:
+    if args.kpi_csv is not None:
+        return args.kpi_csv
+    if args.campaign_dir is not None:
+        if args.method is None or args.run is None:
+            raise ValueError("--campaign-dir requires --method and --run when kpi_csv is omitted.")
+        return (
+            args.campaign_dir
+            / "02_runs"
+            / args.method
+            / normalize_run_name(str(args.run))
+            / "kpi_timeseries.csv"
+        )
+    return newest_kpi_csv()
 
 
 def newest_kpi_csv() -> Path:
@@ -124,9 +154,20 @@ def filter_eval_window(df: pd.DataFrame, start_s: float, end_s: float | None) ->
     return out
 
 
+def save_or_show(path: Path | None, show: bool) -> None:
+    plt.tight_layout()
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(path, dpi=200)
+        print(f"Saved {path}")
+    if show or path is None:
+        plt.show()
+    plt.close()
+
+
 def main() -> None:
     args = parse_args()
-    kpi_path = args.kpi_csv or newest_kpi_csv()
+    kpi_path = resolve_kpi_csv(args)
     tx_path, rx_path = log_paths(kpi_path)
     metadata = load_metadata(kpi_path)
 
@@ -244,7 +285,10 @@ def main() -> None:
     plt.title("PRR validation")
     plt.legend()
     plt.grid()
-    plt.show()
+    save_or_show(
+        args.out_dir / "prr_validation.png" if args.out_dir is not None else None,
+        args.show,
+    )
 
     # =========================
     # 3. PIR AND CBR SANITY
@@ -271,7 +315,10 @@ def main() -> None:
     plt.ylabel("PIR (s)")
     plt.title("PIR vs beacon interval")
     plt.grid()
-    plt.show()
+    save_or_show(
+        args.out_dir / "pir_vs_beacon_interval.png" if args.out_dir is not None else None,
+        args.show,
+    )
 
     # =========================
     # 4. EXACT PRR vs DISTANCE
@@ -293,7 +340,10 @@ def main() -> None:
     plt.ylabel("PRR")
     plt.title("Exact PRR vs TX-time distance")
     plt.grid()
-    plt.show()
+    save_or_show(
+        args.out_dir / "prr_vs_distance.png" if args.out_dir is not None else None,
+        args.show,
+    )
 
 
 if __name__ == "__main__":

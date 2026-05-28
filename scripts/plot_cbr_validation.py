@@ -25,7 +25,13 @@ def parse_args() -> argparse.Namespace:
         "kpi_csv",
         nargs="*",
         type=Path,
-        help="One or more KPI CSV files. Defaults to data/output/kpi*.csv.",
+        help="One or more KPI CSV files. Defaults to campaign runs or data/output/kpi*.csv.",
+    )
+    parser.add_argument(
+        "--campaign-dir",
+        type=Path,
+        default=None,
+        help="Campaign root containing 02_runs/<method>/run_<id>/kpi_timeseries.csv.",
     )
     parser.add_argument(
         "--warmup",
@@ -42,18 +48,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plots-dir",
         type=Path,
-        default=OUTPUT_DIR / "plots",
-        help="Directory for generated PNG plots.",
+        default=None,
+        help="Directory for generated PNG plots. Defaults to campaign 03_analysis/validation_plots.",
     )
     return parser.parse_args()
 
 
-def default_kpi_csvs() -> list[Path]:
+def default_kpi_csvs(campaign_dir: Path | None = None) -> list[Path]:
+    if campaign_dir is not None:
+        return sorted(campaign_dir.glob("02_runs/*/run_*/kpi_timeseries.csv"))
     return sorted(
         path
         for path in OUTPUT_DIR.glob("kpi*.csv")
         if not path.name.endswith(("_tx_packet_log.csv", "_rx_packet_log.csv"))
     )
+
+
+def run_label(kpi_csv: Path, campaign_dir: Path | None) -> str:
+    if campaign_dir is not None:
+        try:
+            rel = kpi_csv.relative_to(campaign_dir / "02_runs")
+            if len(rel.parts) >= 3:
+                return f"{rel.parts[0]}/{rel.parts[1]}"
+        except ValueError:
+            pass
+    return kpi_csv.stem
 
 
 def metadata_path(kpi_csv: Path) -> Path:
@@ -213,9 +232,18 @@ def scatter_3d(
 
 def main() -> None:
     args = parse_args()
-    kpi_paths = args.kpi_csv or default_kpi_csvs()
+    kpi_paths = args.kpi_csv or default_kpi_csvs(args.campaign_dir)
     if not kpi_paths:
-        raise FileNotFoundError(f"No KPI CSV files found in {OUTPUT_DIR}")
+        source = args.campaign_dir if args.campaign_dir is not None else OUTPUT_DIR
+        raise FileNotFoundError(f"No KPI CSV files found in {source}")
+
+    plots_dir = args.plots_dir
+    if plots_dir is None:
+        plots_dir = (
+            args.campaign_dir / "03_analysis" / "validation_plots"
+            if args.campaign_dir is not None
+            else OUTPUT_DIR / "plots"
+        )
 
     frames = []
     rx_frames = []
@@ -245,7 +273,8 @@ def main() -> None:
             df = df[df["time_s"] <= end_s].copy()
         if df.empty:
             continue
-        df["run"] = path.stem
+        label = run_label(path, args.campaign_dir)
+        df["run"] = label
         vehicle_count = load_vehicle_count(path)
         if "vehicle_count" not in df.columns:
             df["vehicle_count"] = vehicle_count
@@ -259,14 +288,14 @@ def main() -> None:
             if end_s is not None:
                 rx = rx[rx["time_s"] <= end_s].copy()
             if not rx.empty:
-                rx["run"] = path.stem
+                rx["run"] = label
                 rx_frames.append(rx)
 
     if not frames:
         raise ValueError("No KPI samples remain after warm-up filtering.")
 
     kpi = pd.concat(frames, ignore_index=True)
-    args.plots_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
     if ((kpi["cbr"] < 0) | (kpi["cbr"] > 1)).any():
         raise ValueError("PHY CBR sanity failed: values outside [0, 1].")
@@ -290,7 +319,7 @@ def main() -> None:
         "Beacon interval Tb (s)",
         "PHY CBR",
         "PHY CBR vs Tb",
-        args.plots_dir / "cbr_vs_tb.png",
+        plots_dir / "cbr_vs_tb.png",
     )
 
     scatter_with_trend(
@@ -300,7 +329,7 @@ def main() -> None:
         "Beacon interval Tb (s)",
         "Sensing exclusion ratio",
         "Sensing exclusion ratio vs Tb",
-        args.plots_dir / "sensing_exclusion_vs_tb.png",
+        plots_dir / "sensing_exclusion_vs_tb.png",
     )
 
     scatter_with_trend(
@@ -310,7 +339,7 @@ def main() -> None:
         "Beacon interval Tb (s)",
         "Mean PIR (s)",
         "Mean PIR vs Tb",
-        args.plots_dir / "pir_vs_tb.png",
+        plots_dir / "pir_vs_tb.png",
     )
 
     scatter_with_trend(
@@ -320,7 +349,7 @@ def main() -> None:
         "Beacon interval Tb (s)",
         "Mean PIR / Tb",
         "Normalized PIR vs Tb",
-        args.plots_dir / "pir_ratio_vs_tb.png",
+        plots_dir / "pir_ratio_vs_tb.png",
     )
 
     density = kpi.dropna(subset=["vehicle_count"])
@@ -332,7 +361,7 @@ def main() -> None:
         plt.ylabel("Mean PHY CBR")
         plt.title("PHY CBR vs density")
         plt.grid(True)
-        save_current(args.plots_dir / "cbr_vs_density.png")
+        save_current(plots_dir / "cbr_vs_density.png")
 
         by_density = density.groupby("vehicle_count", as_index=False)[
             "sensing_exclusion_ratio"
@@ -347,7 +376,7 @@ def main() -> None:
         plt.ylabel("Mean sensing exclusion ratio")
         plt.title("Sensing exclusion ratio vs density")
         plt.grid(True)
-        save_current(args.plots_dir / "sensing_exclusion_vs_density.png")
+        save_current(plots_dir / "sensing_exclusion_vs_density.png")
     else:
         print("Skipped CBR vs density: vehicle_count unavailable in KPI CSV/metadata.")
 
@@ -358,7 +387,7 @@ def main() -> None:
         "Measured density in core (veh/km)",
         "PHY CBR",
         "PHY CBR vs measured density",
-        args.plots_dir / "cbr_vs_measured_density.png",
+        plots_dir / "cbr_vs_measured_density.png",
     )
 
     scatter_with_trend(
@@ -368,7 +397,7 @@ def main() -> None:
         "Measured density in core (veh/km)",
         "PRR within awareness range",
         "PRR vs measured density",
-        args.plots_dir / "prr_vs_measured_density.png",
+        plots_dir / "prr_vs_measured_density.png",
     )
 
     scatter_with_trend(
@@ -378,7 +407,7 @@ def main() -> None:
         "Mean neighbors within 150 m",
         "PRR within awareness range",
         "PRR vs local neighbor count",
-        args.plots_dir / "prr_vs_mean_neighbors_150m.png",
+        plots_dir / "prr_vs_mean_neighbors_150m.png",
     )
 
     scatter_with_trend(
@@ -388,7 +417,7 @@ def main() -> None:
         "PHY CBR",
         "PRR within awareness range",
         "PRR vs PHY CBR",
-        args.plots_dir / "prr_vs_cbr.png",
+        plots_dir / "prr_vs_cbr.png",
     )
 
     scatter_with_trend(
@@ -398,7 +427,7 @@ def main() -> None:
         "PHY CBR",
         "Mean PIR (s)",
         "Mean PIR vs PHY CBR",
-        args.plots_dir / "pir_vs_cbr.png",
+        plots_dir / "pir_vs_cbr.png",
     )
 
     scatter_with_trend(
@@ -408,7 +437,7 @@ def main() -> None:
         "PRR within awareness range",
         "Mean PIR (s)",
         "Mean PIR vs PRR",
-        args.plots_dir / "pir_vs_prr.png",
+        plots_dir / "pir_vs_prr.png",
     )
 
     scatter_with_trend(
@@ -418,7 +447,7 @@ def main() -> None:
         "Sensing exclusion ratio",
         "PRR within awareness range",
         "PRR vs sensing exclusion ratio",
-        args.plots_dir / "prr_vs_sensing_exclusion.png",
+        plots_dir / "prr_vs_sensing_exclusion.png",
     )
 
     scatter_3d(
@@ -430,7 +459,7 @@ def main() -> None:
         "PHY CBR",
         "PRR within awareness range",
         "PRR vs PHY CBR vs measured density",
-        args.plots_dir / "prr_cbr_density_3d.png",
+        plots_dir / "prr_cbr_density_3d.png",
     )
 
     plot_time_series(
@@ -438,7 +467,7 @@ def main() -> None:
         "cbr",
         "PHY CBR",
         "PHY CBR time-series sanity",
-        args.plots_dir / "cbr_timeseries_sanity.png",
+        plots_dir / "cbr_timeseries_sanity.png",
         ylim=(-0.02, 1.02),
     )
 
@@ -447,7 +476,7 @@ def main() -> None:
         "sensing_exclusion_ratio",
         "Sensing exclusion ratio",
         "Sensing exclusion ratio time-series sanity",
-        args.plots_dir / "sensing_exclusion_timeseries_sanity.png",
+        plots_dir / "sensing_exclusion_timeseries_sanity.png",
         ylim=(-0.02, 1.02),
     )
 
@@ -456,7 +485,7 @@ def main() -> None:
         "pir_s",
         "Mean PIR (s)",
         "Mean PIR time-series sanity",
-        args.plots_dir / "pir_timeseries_sanity.png",
+        plots_dir / "pir_timeseries_sanity.png",
     )
 
     plt.figure()
@@ -469,7 +498,7 @@ def main() -> None:
     if kpi["run"].nunique() <= 4:
         plt.legend()
     plt.grid(True)
-    save_current(args.plots_dir / "pir_vs_tb_timeseries.png")
+    save_current(plots_dir / "pir_vs_tb_timeseries.png")
 
     if rx_frames:
         rx_pir = pd.concat(rx_frames, ignore_index=True)
@@ -481,7 +510,7 @@ def main() -> None:
             plt.ylabel("Packet receptions")
             plt.title("Raw RX PIR distribution")
             plt.grid(True)
-            save_current(args.plots_dir / "pir_raw_histogram.png")
+            save_current(plots_dir / "pir_raw_histogram.png")
 
             plt.figure()
             sorted_pir = rx_pir["pir_s"].sort_values().reset_index(drop=True)
@@ -491,7 +520,7 @@ def main() -> None:
             plt.ylabel("CDF")
             plt.title("Raw RX PIR CDF")
             plt.grid(True)
-            save_current(args.plots_dir / "pir_raw_cdf.png")
+            save_current(plots_dir / "pir_raw_cdf.png")
     else:
         print("Skipped raw PIR distribution plots: RX packet logs unavailable.")
 

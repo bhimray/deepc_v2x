@@ -2170,7 +2170,7 @@ main(int argc, char* argv[])
 {
     const auto __ns3_total_compute_start = std::chrono::steady_clock::now();
     // File paths
-    std::string mobilityCsv = "data/processed/ngsim_us101_10min_0p1s_250veh.csv";
+    std::string mobilityCsv = "data/processed/ngsim_us101_mainline_active20_250_densest_600s.csv";
     std::string inputCsv = "data/processed/prbs_schedule.csv";
     std::string kpiCsv = "data/output/deepc_closed_loop_250veh/kpi_timeseries.csv";
     std::string cbrCsv = "data/output/deepc_closed_loop_250veh/cbr_timeseries.csv";

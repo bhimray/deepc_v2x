@@ -14,7 +14,7 @@ DEFAULT_STEM = "paper-100veh-4lane-all-tx-nr-v2x-west-to-east-highway"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot PRR, PIR, and CBR outputs from the modified NR-V2X highway run."
+        description="Generate PRR, PIR, and CBR plots from one modified NR-V2X highway run."
     )
     parser.add_argument(
         "--db",
