@@ -20,6 +20,7 @@
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
 #include "ns3/nr-module.h"
+#include "ns3/nr-sl-ue-rrc.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/tag.h"
 #include "ns3/vdp.h"
@@ -448,14 +449,35 @@ LoadInputScheduleCsv(const std::string& path)
 static void
 InstallWaypointMobility(Ptr<Node> node, const std::vector<MobilityRow>& rows)
 {
+    NS_ABORT_MSG_IF(rows.empty(), "Cannot install waypoint mobility from empty NGSIM track");
+
     Ptr<WaypointMobilityModel> mob = CreateObject<WaypointMobilityModel>();
     node->AggregateObject(mob);
+
+    const Vector inactiveParkingPosition(
+        -10000.0 - static_cast<double>(node->GetId()),
+        -10000.0,
+        0.0);
+    constexpr double waypointEpsS = 1e-6;
+
+    if (rows.front().timeS > 0.0)
+    {
+        mob->AddWaypoint(Waypoint(Seconds(0.0), inactiveParkingPosition));
+        if (rows.front().timeS > waypointEpsS)
+        {
+            mob->AddWaypoint(Waypoint(Seconds(rows.front().timeS - waypointEpsS),
+                                      inactiveParkingPosition));
+        }
+    }
 
     for (const auto& r : rows)
     {
         Waypoint wp(Seconds(r.timeS), Vector(r.xM, r.yM, 0.0));
         mob->AddWaypoint(wp);
     }
+
+    mob->AddWaypoint(Waypoint(Seconds(rows.back().timeS + waypointEpsS),
+                              inactiveParkingPosition));
 }
 
 static void
@@ -1449,6 +1471,36 @@ ApplyInputsAtTime(Ptr<KpiLogger> logger, NetDeviceContainer ueDevs, double pDbm,
 }
 
 static void
+AssignDeterministicSourceL2Ids(const NetDeviceContainer& ueDevs)
+{
+    uint32_t ueIndex = 0;
+    for (auto it = ueDevs.Begin(); it != ueDevs.End(); ++it, ++ueIndex)
+    {
+        // SCI format 2 carries an 8-bit source id in this ns-3 NR model.
+        // Keep it nonzero on the wire; 255 is left for the group destination.
+        const uint32_t sourceL2Id = 1 + (ueIndex % 254);
+        Ptr<NrUeNetDevice> ueDev = DynamicCast<NrUeNetDevice>(*it);
+        NS_ABORT_MSG_IF(ueDev == nullptr, "Device is not NrUeNetDevice");
+        Ptr<LteUeRrc> lteRrc = ueDev->GetRrc();
+        Ptr<NrSlUeRrc> nrSlRrc = lteRrc->GetObject<NrSlUeRrc>();
+        NS_ABORT_MSG_IF(nrSlRrc == nullptr, "Missing NrSlUeRrc while assigning source L2 IDs");
+        nrSlRrc->SetSourceL2Id(sourceL2Id);
+        NS_ABORT_MSG_IF(lteRrc->GetSourceL2Id() == 0,
+                        "Failed to assign nonzero source L2 ID for UE device");
+
+        for (uint32_t bwp = 0; bwp < ueDev->GetCcMapSize(); ++bwp)
+        {
+            Ptr<NrSlUeMac> slMac =
+                ueDev->GetMac(static_cast<uint8_t>(bwp))->GetObject<NrSlUeMac>();
+            if (slMac)
+            {
+                slMac->GetNrSlUeCmacSapProvider()->SetSourceL2Id(sourceL2Id);
+            }
+        }
+    }
+}
+
+static void
 ScheduleInputUpdates(Ptr<KpiLogger> logger, const NetDeviceContainer& ueDevs)
 {
     for (const auto& u : g_inputSchedule)
@@ -1843,7 +1895,7 @@ main(int argc, char* argv[])
         return 0;
     }
 
-    // Create nodes
+    // Create nodes from vehicleIds and install mobility
     NodeContainer allSlUesContainer;
     allSlUesContainer.Create(vehicleIds.size());
 
@@ -1936,6 +1988,7 @@ main(int argc, char* argv[])
     nrSlHelper->SetNrSlSchedulerTypeId(NrSlUeMacSchedulerFixedMcs::GetTypeId());
     nrSlHelper->SetUeSlSchedulerAttribute("Mcs", UintegerValue(mcs));
     nrSlHelper->PrepareUeForSidelink(allSlUesNetDeviceContainer, bwpIdContainer);
+    AssignDeterministicSourceL2Ids(allSlUesNetDeviceContainer);
 
     /**************** SL preconfiguration ****************/
     LteRrcSap::SlResourcePoolNr slResourcePoolNr;
@@ -2016,6 +2069,7 @@ main(int argc, char* argv[])
     slPreConfigNr.slPreconfigFreqInfoList[0] = slFreConfigCommonNr;
 
     nrSlHelper->InstallNrSlPreConfiguration(allSlUesNetDeviceContainer, slPreConfigNr);
+    AssignDeterministicSourceL2Ids(allSlUesNetDeviceContainer);
 
     /**************** IP stack + SL bearer ****************/
     InternetStackHelper internet;
