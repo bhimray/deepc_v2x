@@ -74,9 +74,7 @@ struct TxEvent
     double timeS;
     uint32_t txNodeId;
     uint64_t seq;
-    Vector posTx;
     uint32_t eligibleRxCount;
-    std::vector<uint32_t> eligibleRxCountsByBin;
     std::map<uint32_t, double> rxDistanceAtTxM;
 };
 
@@ -86,12 +84,7 @@ struct RxEvent
     uint32_t txNodeId;
     uint32_t rxNodeId;
     uint64_t seq;
-    Vector posTx;
-    Vector posRx;
-    double distanceAtTxM;
-    double distanceAtRxM;
     double pirS;
-    double delayS;
 };
 
 class KpiPacketTag : public Tag
@@ -530,8 +523,7 @@ class KpiLogger : public Object
                    bool enableCoreFilter,
                    const std::string& coreAxis,
                    double coreMin,
-                   double coreMax,
-                   double densityLengthM)
+                   double coreMax)
     {
         m_cbrLogger = cbrLogger;
         m_awarenessRangeM = awarenessRangeM;
@@ -543,13 +535,11 @@ class KpiLogger : public Object
         m_coreAxis = coreAxis;
         m_coreMin = coreMin;
         m_coreMax = coreMax;
-        m_densityLengthM = densityLengthM;
 
         for (uint32_t i = 0; i < nodes.GetN(); ++i)
         {
             Ptr<Node> n = nodes.Get(i);
             m_nodes.push_back(n);
-            m_nodeIds.insert(n->GetId());
         }
         m_out.open(csvPath.c_str(), std::ios::out | std::ios::trunc);
         if (!m_out.is_open())
@@ -557,44 +547,7 @@ class KpiLogger : public Object
             NS_FATAL_ERROR("Cannot open KPI output CSV: " << csvPath);
         }
         m_out << "time_s,tx_power_dbm,beacon_interval_s,"
-              << "active_vehicle_count_core,density_veh_per_km_core,"
-              << "mean_neighbors_150m,mean_neighbors_300m,"
-              << "prr_awareness,pir_s,cbr,sensing_exclusion_ratio\n";
-
-        std::string txLogPath = csvPath;
-        std::string rxLogPath = csvPath;
-
-        std::size_t pos = txLogPath.rfind(".csv");
-        if (pos != std::string::npos)
-        {
-            txLogPath.replace(pos, 4, "_tx_packet_log.csv");
-            rxLogPath.replace(pos, 4, "_rx_packet_log.csv");
-        }
-        else
-        {
-            txLogPath += "_tx_packet_log.csv";
-            rxLogPath += "_rx_packet_log.csv";
-        }
-
-        m_txOut.open(txLogPath.c_str(), std::ios::out | std::ios::trunc);
-        if (!m_txOut.is_open())
-        {
-            NS_FATAL_ERROR("Cannot open TX packet log CSV: " << txLogPath);
-        }
-        m_txOut << "time_s,tx_node_id,seq,tx_x_m,tx_y_m,eligible_rx_count_awareness";
-        for (uint32_t i = 0; i + 1 < m_distanceBinEdgesM.size(); ++i)
-        {
-            m_txOut << "," << BuildDistanceBinColumnName(i);
-        }
-        m_txOut << "\n";
-
-        m_rxOut.open(rxLogPath.c_str(), std::ios::out | std::ios::trunc);
-        if (!m_rxOut.is_open())
-        {
-            NS_FATAL_ERROR("Cannot open RX packet log CSV: " << rxLogPath);
-        }
-        m_rxOut << "time_s,tx_node_id,rx_node_id,seq,tx_x_m,tx_y_m,rx_x_m,rx_y_m,"
-                << "distance_m,rx_distance_m,pir_s,delay_s\n";
+              << "active_vehicle_count_core,prr_awareness,pir_s,cbr\n";
     }
 
     void RegisterNodeIpv4(uint32_t nodeId, const Ipv4Address& addr)
@@ -627,8 +580,6 @@ class KpiLogger : public Object
             return;
         }
 
-        uint32_t eligible = 0;
-        std::vector<uint32_t> eligibleByBin(m_distanceBinEdgesM.size() - 1, 0);
         std::map<uint32_t, double> rxDistanceAtTxM;
 
         for (const auto& node : m_nodes)
@@ -649,16 +600,9 @@ class KpiLogger : public Object
             }
 
             const double distanceM = Distance2d(posTx, posRx);
-            const int bin = GetDistanceBinIndex(distanceM);
-            if (bin >= 0)
-            {
-                eligibleByBin[static_cast<uint32_t>(bin)]++;
-                rxDistanceAtTxM[node->GetId()] = distanceM;
-            }
-
             if (distanceM <= m_awarenessRangeM)
             {
-                eligible++;
+                rxDistanceAtTxM[node->GetId()] = distanceM;
             }
         }
 
@@ -666,29 +610,10 @@ class KpiLogger : public Object
         ev.timeS = timeS;
         ev.txNodeId = txNodeId;
         ev.seq = seq;
-        ev.posTx = posTx;
-        ev.eligibleRxCount = eligible;
-        ev.eligibleRxCountsByBin = eligibleByBin;
+        ev.eligibleRxCount = static_cast<uint32_t>(rxDistanceAtTxM.size());
         ev.rxDistanceAtTxM = rxDistanceAtTxM;
 
         m_txEvents.push_back(ev);
-
-        if (m_txOut.is_open())
-        {
-            m_txOut << std::fixed << std::setprecision(6)
-                    << ev.timeS << ","
-                    << ev.txNodeId << ","
-                    << ev.seq << ","
-                    << ev.posTx.x << ","
-                    << ev.posTx.y << ","
-                    << ev.eligibleRxCount;
-            for (const auto& count : ev.eligibleRxCountsByBin)
-            {
-                m_txOut << "," << count;
-            }
-            m_txOut << "\n";
-            m_txOut.flush();
-        }
 
         PruneOldEvents();
     }
@@ -697,9 +622,7 @@ class KpiLogger : public Object
            uint32_t rxNodeId,
            uint64_t seq,
            Time tRx,
-           const Vector& posTx,
-           const Vector& posRx,
-           double delayS)
+           const Vector& posRx)
     {
         const double timeS = tRx.GetSeconds();
         if (!IsInsideEvaluationWindow(timeS) || !IsNodeActiveAtTime(txNodeId, timeS) ||
@@ -714,7 +637,12 @@ class KpiLogger : public Object
             return;
         }
 
-        if (!IsInsideCore(txEvent->posTx) || !IsInsideCore(posRx))
+        if (!IsInsideCore(posRx))
+        {
+            return;
+        }
+        auto distIt = txEvent->rxDistanceAtTxM.find(rxNodeId);
+        if (distIt == txEvent->rxDistanceAtTxM.end())
         {
             return;
         }
@@ -736,55 +664,14 @@ class KpiLogger : public Object
         }
         m_lastRxTimePerPair[key] = tRx.GetSeconds();
 
-        Vector txPosAtTx = txEvent->posTx;
-        double distanceAtTxM = Distance2d(txEvent->posTx, posRx);
-        auto distIt = txEvent->rxDistanceAtTxM.find(rxNodeId);
-        if (distIt != txEvent->rxDistanceAtTxM.end())
-        {
-            distanceAtTxM = distIt->second;
-        }
-
-        const double distanceAtRxM = Distance2d(posTx, posRx);
-
         RxEvent ev;
         ev.timeS = timeS;
         ev.txNodeId = txNodeId;
         ev.rxNodeId = rxNodeId;
         ev.seq = seq;
-        ev.posTx = txPosAtTx;
-        ev.posRx = posRx;
-        ev.distanceAtTxM = distanceAtTxM;
-        ev.distanceAtRxM = distanceAtRxM;
         ev.pirS = pir;
-        ev.delayS = delayS;
 
         m_rxEvents.push_back(ev);
-
-        if (m_rxOut.is_open())
-        {
-            m_rxOut << std::fixed << std::setprecision(6)
-                    << ev.timeS << ","
-                    << ev.txNodeId << ","
-                    << ev.rxNodeId << ","
-                    << ev.seq << ","
-                    << ev.posTx.x << ","
-                    << ev.posTx.y << ","
-                    << ev.posRx.x << ","
-                    << ev.posRx.y << ","
-                    << ev.distanceAtTxM << ","
-                    << ev.distanceAtRxM << ",";
-
-            if (std::isnan(ev.pirS))
-            {
-                m_rxOut << "nan,";
-            }
-            else
-            {
-                m_rxOut << ev.pirS << ",";
-            }
-            m_rxOut << ev.delayS << "\n";
-            m_rxOut.flush();
-        }
 
         PruneOldEvents();
     }
@@ -806,8 +693,7 @@ class KpiLogger : public Object
         std::set<std::tuple<uint32_t, uint32_t, uint64_t>> uniqueRxTriples;
         for (const auto& rx : m_rxEvents)
         {
-            if (activeTxKeys.find(std::make_tuple(rx.txNodeId, rx.seq)) != activeTxKeys.end() &&
-                rx.distanceAtTxM <= m_awarenessRangeM)
+            if (activeTxKeys.find(std::make_tuple(rx.txNodeId, rx.seq)) != activeTxKeys.end())
             {
                 uniqueRxTriples.insert(std::make_tuple(rx.txNodeId, rx.rxNodeId, rx.seq));
             }
@@ -829,23 +715,16 @@ class KpiLogger : public Object
         pirMean = (pirCount > 0) ? pirMean / static_cast<double>(pirCount) : 0.0;
 
         const double cbr = m_cbrLogger ? m_cbrLogger->ComputeCbr(now) : 0.0;
-        const double sensingExclusionRatio =
-            m_cbrLogger ? m_cbrLogger->ComputeSensingExclusionRatio(now) : 0.0;
-        const TrafficContext traffic = ComputeTrafficContext();
+        const uint32_t activeVehicleCount = CountActiveCoreVehicles(now);
+        MaybePrintProgress(now, activeVehicleCount);
 
         m_out << std::fixed << std::setprecision(6) << now << ","
               << m_currentP << ","
               << m_currentTb << ","
-              << traffic.activeVehicleCount << ","
-              << traffic.densityVehPerKm << ","
-              << traffic.meanNeighbors150m << ","
-              << traffic.meanNeighbors300m << ","
+              << activeVehicleCount << ","
               << prr << ","
               << pirMean << ","
-              << cbr << ","
-              << sensingExclusionRatio << "\n";
-
-        m_out.flush();
+              << cbr << "\n";
 
         Simulator::Schedule(Seconds(m_sampleTimeS), &KpiLogger::SampleAndWrite, this);
     }
@@ -856,83 +735,35 @@ class KpiLogger : public Object
         {
             m_out.close();
         }
-        if (m_txOut.is_open())
-        {
-            m_txOut.close();
-        }
-        if (m_rxOut.is_open())
-        {
-            m_rxOut.close();
-        }
     }
 
   private:
-    struct TrafficContext
+    uint32_t CountActiveCoreVehicles(double timeS) const
     {
-        uint32_t activeVehicleCount = 0;
-        double densityVehPerKm = 0.0;
-        double meanNeighbors150m = 0.0;
-        double meanNeighbors300m = 0.0;
-    };
-
-    TrafficContext ComputeTrafficContext() const
-    {
-        std::vector<Vector> activePositions;
-        activePositions.reserve(m_nodes.size());
-
+        uint32_t count = 0;
         for (const auto& node : m_nodes)
         {
-            if (!IsNodeActiveAtTime(node->GetId(), Simulator::Now().GetSeconds()))
+            if (!IsNodeActiveAtTime(node->GetId(), timeS))
             {
                 continue;
             }
             const Vector pos = node->GetObject<MobilityModel>()->GetPosition();
             if (IsInsideCore(pos))
             {
-                activePositions.push_back(pos);
+                count++;
             }
         }
+        return count;
+    }
 
-        TrafficContext context;
-        context.activeVehicleCount = static_cast<uint32_t>(activePositions.size());
-        if (m_densityLengthM > 0.0)
+    void MaybePrintProgress(double timeS, uint32_t activeVehicleCount)
+    {
+        const int64_t second = static_cast<int64_t>(std::floor(timeS + 1e-9));
+        if (second >= 1 && second != m_lastProgressSecond)
         {
-            context.densityVehPerKm =
-                static_cast<double>(context.activeVehicleCount) / (m_densityLengthM / 1000.0);
+            std::cout << "t=" << second << ", v=" << activeVehicleCount << std::endl;
+            m_lastProgressSecond = second;
         }
-
-        if (activePositions.empty())
-        {
-            return context;
-        }
-
-        uint64_t neighborCount150m = 0;
-        uint64_t neighborCount300m = 0;
-        for (uint32_t i = 0; i < activePositions.size(); ++i)
-        {
-            for (uint32_t j = 0; j < activePositions.size(); ++j)
-            {
-                if (i == j)
-                {
-                    continue;
-                }
-
-                const double distanceM = Distance2d(activePositions[i], activePositions[j]);
-                if (distanceM <= 150.0)
-                {
-                    neighborCount150m++;
-                }
-                if (distanceM <= 300.0)
-                {
-                    neighborCount300m++;
-                }
-            }
-        }
-
-        const double activeCount = static_cast<double>(activePositions.size());
-        context.meanNeighbors150m = static_cast<double>(neighborCount150m) / activeCount;
-        context.meanNeighbors300m = static_cast<double>(neighborCount300m) / activeCount;
-        return context;
     }
 
     void PruneOldEvents()
@@ -974,30 +805,6 @@ class KpiLogger : public Object
                          m_rxEvents.end());
     }
 
-    int GetDistanceBinIndex(double distanceM) const
-    {
-        for (uint32_t i = 0; i + 1 < m_distanceBinEdgesM.size(); ++i)
-        {
-            const double low = m_distanceBinEdgesM[i];
-            const double high = m_distanceBinEdgesM[i + 1];
-            const bool isLastBin = (i + 2 == m_distanceBinEdgesM.size());
-            if (distanceM >= low && (distanceM < high || (isLastBin && distanceM <= high)))
-            {
-                return static_cast<int>(i);
-            }
-        }
-        return -1;
-    }
-
-    std::string BuildDistanceBinColumnName(uint32_t index) const
-    {
-        std::ostringstream os;
-        os << "eligible_"
-           << static_cast<uint32_t>(m_distanceBinEdgesM[index]) << "_"
-           << static_cast<uint32_t>(m_distanceBinEdgesM[index + 1]) << "m";
-        return os.str();
-    }
-
     bool IsInsideEvaluationWindow(double timeS) const
     {
         return timeS >= m_evalStartS && (m_evalEndS < 0.0 || timeS <= m_evalEndS);
@@ -1024,22 +831,20 @@ class KpiLogger : public Object
 
     double m_awarenessRangeM = 150.0;
     double m_kpiWindowS = 1.0;
-    double m_sampleTimeS = 0.1;
+    double m_sampleTimeS = 0.5;
     double m_evalStartS = 0.0;
     double m_evalEndS = -1.0;
     bool m_enableCoreFilter = true;
     std::string m_coreAxis = "y";
     double m_coreMin = 0.0;
     double m_coreMax = 0.0;
-    double m_densityLengthM = 1.0;
     CbrLogger* m_cbrLogger = nullptr;
 
     double m_currentP = 23.0;
     double m_currentTb = 0.1;
-    std::vector<double> m_distanceBinEdgesM = {0.0, 50.0, 100.0, 150.0, 200.0, 300.0};
+    int64_t m_lastProgressSecond = -1;
 
     std::vector<Ptr<Node>> m_nodes;
-    std::set<uint32_t> m_nodeIds;
     std::unordered_map<uint32_t, uint32_t> m_ipToNodeId;
 
     std::deque<TxEvent> m_txEvents;
@@ -1048,8 +853,6 @@ class KpiLogger : public Object
     std::map<std::pair<uint32_t, uint32_t>, double> m_lastRxTimePerPair;
 
     std::ofstream m_out;
-    std::ofstream m_txOut;
-    std::ofstream m_rxOut;
 };
 
 class NgsimVehicleDataProvider : public VDP
@@ -1261,17 +1064,13 @@ class CamApplication : public Application
   public:
     void Setup(Ptr<Node> node,
                Ptr<KpiLogger> logger,
-               Ipv4Address localIpv4,
                Ipv4Address groupIpv4,
-               uint16_t port,
-               uint32_t maxCamSizeBytes)
+               uint16_t port)
     {
         m_node = node;
         m_logger = logger;
-        m_localIpv4 = localIpv4;
         m_groupIpv4 = groupIpv4;
         m_port = port;
-        m_maxCamSizeBytes = maxCamSizeBytes;
     }
 
     void SetBeaconInterval(double tb)
@@ -1390,8 +1189,6 @@ class CamApplication : public Application
             return;
         }
         const uint64_t kpiSeq = kpiTag.GetSequence();
-        const double delayS =
-            static_cast<double>(Simulator::Now().GetNanoSeconds() - kpiTag.GetTxTimeNs()) / 1e9;
         const uint32_t stationId = asn1cpp::getField(cam->header.stationId, uint32_t);
 
         if (stationId != txNodeId)
@@ -1399,22 +1196,13 @@ class CamApplication : public Application
             return;
         }
 
-        Ptr<Node> txNode = g_nodeIdToNode[txNodeId];
-        if (!txNode)
-        {
-            return;
-        }
-
-        Vector posTx = txNode->GetObject<MobilityModel>()->GetPosition();
         Vector posRx = m_node->GetObject<MobilityModel>()->GetPosition();
 
         m_logger->LogRx(txNodeId,
                         m_node->GetId(),
                         kpiSeq,
                         Simulator::Now(),
-                        posTx,
-                        posRx,
-                        delayS);
+                        posRx);
     }
 
     Ptr<Node> m_node;
@@ -1429,11 +1217,9 @@ class CamApplication : public Application
     bool m_useEtsiCamGeneration = true;
 
     double m_tGenCamMaxS = 1.0;
-    uint32_t m_maxCamSizeBytes = 300;
 
     uint64_t m_nextKpiSequence = 0;
 
-    Ipv4Address m_localIpv4;
     Ipv4Address m_groupIpv4;
     uint16_t m_port = 8000;
 };
@@ -1517,9 +1303,6 @@ ScheduleInputUpdates(Ptr<KpiLogger> logger, const NetDeviceContainer& ueDevs)
 static void
 ConnectCbrTraces(CbrLogger* cbrLogger)
 {
-    Config::Connect("/NodeList/*/DeviceList/*/ComponentCarrierMapUe/*/NrUeMac/SensingAlgorithm",
-                    MakeCallback(&CbrLogger::RecordSensingAlgorithm, cbrLogger));
-
     Config::Connect("/NodeList/*/DeviceList/*/ComponentCarrierMapUe/*/NrUePhy/NrSpectrumPhy/"
                     "ChannelOccupied",
                     MakeCallback(&CbrLogger::RecordChannelOccupied, cbrLogger));
@@ -1574,7 +1357,6 @@ JsonEscape(const std::string& value)
 
 static void
 WriteMetadataJson(const std::string& kpiCsv,
-                  const std::string& cbrCsv,
                   const std::string& mobilityCsv,
                   const std::string& inputCsv,
                   double simTimeSeconds,
@@ -1591,7 +1373,6 @@ WriteMetadataJson(const std::string& kpiCsv,
                   double coreGuardBandM,
                   double coreMin,
                   double coreMax,
-                  double densityLengthM,
                   double awarenessRangeM,
                   uint32_t maxCamSizeBytes,
                   bool useInputSchedule,
@@ -1626,7 +1407,6 @@ WriteMetadataJson(const std::string& kpiCsv,
         << "  \"mobility_csv\": \"" << JsonEscape(mobilityCsv) << "\",\n"
         << "  \"input_csv\": \"" << JsonEscape(inputCsv) << "\",\n"
         << "  \"kpi_csv\": \"" << JsonEscape(kpiCsv) << "\",\n"
-        << "  \"cbr_csv\": \"" << JsonEscape(cbrCsv) << "\",\n"
         << "  \"sim_time_s\": " << simTimeSeconds << ",\n"
         << "  \"sample_time_s\": " << sampleTimeS << ",\n"
         << "  \"kpi_window_s\": " << kpiWindowS << ",\n"
@@ -1641,7 +1421,6 @@ WriteMetadataJson(const std::string& kpiCsv,
         << "  \"core_guard_band_m\": " << coreGuardBandM << ",\n"
         << "  \"core_min_m\": " << coreMin << ",\n"
         << "  \"core_max_m\": " << coreMax << ",\n"
-        << "  \"density_length_m\": " << densityLengthM << ",\n"
         << "  \"awareness_range_m\": " << awarenessRangeM << ",\n"
         << "  \"max_cam_encoded_size_bytes\": " << maxCamSizeBytes << ",\n"
         << "  \"cam_payload_format\": \"ETSI CAM ASN.1 UPER encoded payload with "
@@ -1676,25 +1455,17 @@ WriteMetadataJson(const std::string& kpiCsv,
            "awareness_range_m divided by TX-time eligible receiver opportunities; TX and RX "
            "events are filtered to the evaluation time window and core corridor region when enabled\",\n"
         << "  \"traffic_context_definition\": \"time-varying measured context sampled at the KPI "
-           "timestamp: active_vehicle_count_core is the number of evaluated vehicles inside the "
-           "core region, density_veh_per_km_core divides that count by density_length_m, and "
-           "mean_neighbors_150m/300m are per-vehicle instantaneous neighbor counts among active "
-           "core vehicles using 2D Euclidean distance\",\n"
+           "timestamp: active_vehicle_count_core is the number of evaluated vehicles active and "
+           "inside the core region\",\n"
         << "  \"cbr_definition\": \"PHY busy-time fraction over the 1.0 s window from "
            "NrSpectrumPhy::ChannelOccupied, averaged over evaluated UE nodes; evaluated nodes "
            "with no busy interval in the window contribute zero busy time\",\n"
         << "  \"cbr_primary_source\": \"NrSpectrumPhy::ChannelOccupied busy-time trace\",\n"
-        << "  \"sensing_exclusion_ratio_definition\": \"N_excluded_candidate_resources / "
-           "N_initial_candidate_resources over the 1.0 s window from "
-           "NrSlUeMac::SensingAlgorithm; this is a resource-selection diagnostic and is not "
-           "used as CBR\",\n"
         << "  \"cbr_alignment_method\": \"CBR and PRR/PIR are sampled by the simulator at the same "
-           "0.1 s timestamps; no interpolation is applied\",\n"
+        << sampleTimeS << " s timestamps; no interpolation is applied\",\n"
         << "  \"deepc_dataset_columns\": "
            "\"time_s,tx_power_dbm,beacon_interval_s,active_vehicle_count_core,"
-           "density_veh_per_km_core,mean_neighbors_150m,mean_neighbors_300m,"
-           "prr_awareness,pir_s,cbr,sensing_exclusion_ratio\",\n"
-        << "  \"distance_bins_m\": [0, 50, 100, 150, 200, 300]\n"
+           "prr_awareness,pir_s,cbr\"\n"
         << "}\n";
 }
 
@@ -1710,7 +1481,6 @@ main(int argc, char* argv[])
     std::string mobilityCsv = "data/processed/ngsim_us101_mainline_active20_250_densest_600s.csv";
     std::string inputCsv = "data/processed/prbs_schedule.csv";
     std::string kpiCsv = "data/output/deepc_open_loop_250veh/kpi_timeseries.csv";
-    std::string cbrCsv = "data/output/deepc_open_loop_250veh/cbr_timeseries.csv";
 
     // Simulation time
     double simTimeSeconds = 600.0;
@@ -1720,7 +1490,6 @@ main(int argc, char* argv[])
     uint32_t run = 1;
 
     // Traffic / app
-    bool useIPv6 = false;
     uint32_t maxCamSizeBytes = 300;
     uint16_t port = 8000;
     bool useInputSchedule = true;
@@ -1747,7 +1516,7 @@ main(int argc, char* argv[])
     double slProbResourceKeep = 0.0;
     uint16_t slMaxTxTransNumPssch = 5;
     uint16_t reservationPeriod = 100;
-    bool enableSensing = true;
+    bool enableSensing = false;
     uint16_t t1 = 2;
     uint16_t t2 = 33;
     int slThresPsschRsrp = -128;
@@ -1756,7 +1525,7 @@ main(int argc, char* argv[])
     uint16_t mcs = 6;
     double awarenessRangeM = 300.0;
     double kpiWindowS = 1.0;
-    double sampleTimeS = 0.1;
+    double sampleTimeS = 0.5;
     uint32_t maxVehicles = 250; // 0 means all vehicles
     bool enableCoreFilter = true;
     std::string coreAxis = "auto";
@@ -1770,7 +1539,6 @@ main(int argc, char* argv[])
     cmd.AddValue("mobilityCsv", "Processed NGSIM mobility CSV", mobilityCsv);
     cmd.AddValue("inputCsv", "PRBS schedule CSV", inputCsv);
     cmd.AddValue("kpiCsv", "Output KPI CSV", kpiCsv);
-    cmd.AddValue("cbrCsv", "Output standalone CBR CSV", cbrCsv);
     cmd.AddValue("simTime", "Simulation time [s]", simTimeSeconds);
     cmd.AddValue("warmup", "Warm-up duration excluded from KPI evaluation [s]", warmupS);
     cmd.AddValue("cooldown", "Final cool-down duration excluded from KPI evaluation [s]", cooldownS);
@@ -1804,11 +1572,7 @@ main(int argc, char* argv[])
     cmd.Parse(argc, argv);
 
     NS_ABORT_MSG_IF(std::abs(kpiWindowS - 1.0) > 1e-9,
-                    "CBR sensing window is fixed by the experiment definition: kpiWindow must be 1.0 s");
-    NS_ABORT_MSG_IF(std::abs(sampleTimeS - 0.1) > 1e-9,
-                    "CBR output sampling is fixed by the experiment definition: sampleTime must be 0.1 s");
-    NS_ABORT_MSG_IF(!enableSensing,
-                    "CBR requires NR sidelink sensing. Run with --enableSensing=true.");
+                    "CBR window is fixed by the experiment definition: kpiWindow must be 1.0 s");
     NS_ABORT_MSG_IF(warmupS < 0.0 || cooldownS < 0.0,
                     "warmup and cooldown must be non-negative");
     NS_ABORT_MSG_IF(warmupS + cooldownS >= simTimeSeconds,
@@ -1836,9 +1600,6 @@ main(int argc, char* argv[])
     }
     NS_ABORT_MSG_IF(enableCoreFilter && coreMin >= coreMax,
                     "Invalid core region. Reduce coreGuardBand or set coreMin/coreMax.");
-
-    const double densityLengthM = enableCoreFilter ? (coreMax - coreMin) : (studyMax - studyMin);
-    NS_ABORT_MSG_IF(densityLengthM <= 0.0, "Density evaluation length must be positive");
 
     const double evalStartS = warmupS;
     const double evalEndS = simTimeSeconds - cooldownS;
@@ -1956,7 +1717,7 @@ main(int argc, char* argv[])
     nrHelper->SetUePhyAttribute("TxPower", DoubleValue(txPower));
 
     nrHelper->SetUeMacTypeId(NrSlUeMac::GetTypeId());
-    nrHelper->SetUeMacAttribute("EnableSensing", BooleanValue(true));
+    nrHelper->SetUeMacAttribute("EnableSensing", BooleanValue(enableSensing));
     nrHelper->SetUeMacAttribute("T1", UintegerValue(static_cast<uint8_t>(t1)));
     nrHelper->SetUeMacAttribute("T2", UintegerValue(t2));
     nrHelper->SetUeMacAttribute("ActivePoolId", UintegerValue(0));
@@ -2077,8 +1838,6 @@ main(int argc, char* argv[])
 
     uint32_t dstL2Id = 255;
     Ipv4Address groupAddress4("225.0.0.0");
-    Address remoteAddress;
-    Address localAddress;
 
     Ptr<LteSlTft> tft;
     SidelinkInfo slInfo;
@@ -2088,8 +1847,6 @@ main(int argc, char* argv[])
     slInfo.m_dynamic = false;
     slInfo.m_pdb = delayBudget;
     slInfo.m_harqEnabled = harqEnabled;
-
-    NS_ABORT_MSG_IF(useIPv6, "This merged file currently supports IPv4 only.");
 
     Ipv4InterfaceContainer ueIpIface = epcHelper->AssignUeIpv4Address(allSlUesNetDeviceContainer);
 
@@ -2102,9 +1859,6 @@ main(int argc, char* argv[])
         ueStaticRouting->SetDefaultRoute(epcHelper->GetUeDefaultGatewayAddress(), 1);
     }
 
-    remoteAddress = InetSocketAddress(groupAddress4, port);
-    localAddress = InetSocketAddress(Ipv4Address::GetAny(), port);
-
     tft = Create<LteSlTft>(LteSlTft::Direction::TRANSMIT, groupAddress4, slInfo);
     nrSlHelper->ActivateNrSlBearer(slBearersActivationTime, allSlUesNetDeviceContainer, tft);
 
@@ -2113,7 +1867,7 @@ main(int argc, char* argv[])
 
     /**************** KPI logger ****************/
     CbrLogger cbrLogger;
-    cbrLogger.Setup(1.0, 0.1, cbrCsv);
+    cbrLogger.Setup(1.0);
     cbrLogger.SetEvaluationWindow(evalStartS, evalEndS);
     std::vector<uint32_t> evaluatedNodeIds;
     evaluatedNodeIds.reserve(allSlUesContainer.GetN());
@@ -2143,7 +1897,6 @@ main(int argc, char* argv[])
             return IsInsideCoreRegion(GetCoreCoordinate(pos, coreAxis), coreMin, coreMax);
         });
     ConnectCbrTraces(&cbrLogger);
-    cbrLogger.Start();
 
     Ptr<KpiLogger> logger = CreateObject<KpiLogger>();
     logger->Configure(allSlUesContainer,
@@ -2157,8 +1910,7 @@ main(int argc, char* argv[])
                       enableCoreFilter,
                       coreAxis,
                       coreMin,
-                      coreMax,
-                      densityLengthM);
+                      coreMax);
 
     for (uint32_t i = 0; i < allSlUesContainer.GetN(); ++i)
     {
@@ -2173,11 +1925,9 @@ main(int argc, char* argv[])
     for (uint32_t i = 0; i < allSlUesContainer.GetN(); ++i)
     {
         Ptr<Node> node = allSlUesContainer.Get(i);
-        Ipv4Address localAddr =
-            node->GetObject<Ipv4L3Protocol>()->GetAddress(1, 0).GetLocal();
 
         Ptr<CamApplication> app = CreateObject<CamApplication>();
-        app->Setup(node, logger, localAddr, groupAddress4, port, maxCamSizeBytes);
+        app->Setup(node, logger, groupAddress4, port);
         app->SetEtsiCamGeneration(etsiCamGeneration);
         app->SetBeaconInterval(fixedBeaconIntervalS);
         node->AddApplication(app);
@@ -2204,7 +1954,6 @@ main(int argc, char* argv[])
     Simulator::Schedule(Seconds(sampleTimeS), &KpiLogger::SampleAndWrite, logger);
 
     WriteMetadataJson(kpiCsv,
-                      cbrCsv,
                       mobilityCsv,
                       inputCsv,
                       simTimeSeconds,
@@ -2221,7 +1970,6 @@ main(int argc, char* argv[])
                       coreGuardBandM,
                       coreMin,
                       coreMax,
-                      densityLengthM,
                       awarenessRangeM,
                       maxCamSizeBytes,
                       useInputSchedule,

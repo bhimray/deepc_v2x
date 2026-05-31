@@ -10,10 +10,18 @@
 using namespace ns3;
 
 void
+CbrLogger::Setup(double windowS)
+{
+    m_window = windowS;
+    m_writeCsv = false;
+}
+
+void
 CbrLogger::Setup(double windowS, double stepS, const std::string& filename)
 {
     m_window = windowS;
     m_step = stepS;
+    m_writeCsv = true;
 
     m_out.open(filename.c_str(), std::ios::out | std::ios::trunc);
     if (!m_out.is_open())
@@ -380,10 +388,9 @@ CbrLogger::Sample()
     const double cbr = ComputeCbr(now);
     const double sensingExclusionRatio = ComputeSensingExclusionRatio(now);
 
-    if (IsInsideEvaluationWindow(now))
+    if (m_writeCsv && IsInsideEvaluationWindow(now))
     {
         m_out << now << "," << cbr << "," << sensingExclusionRatio << "\n";
-        m_out.flush();
     }
 
     Simulator::Schedule(Seconds(m_step), &CbrLogger::Sample, this);
@@ -392,5 +399,8 @@ CbrLogger::Sample()
 void
 CbrLogger::Start()
 {
-    Simulator::Schedule(Seconds(m_step), &CbrLogger::Sample, this);
+    if (m_writeCsv)
+    {
+        Simulator::Schedule(Seconds(m_step), &CbrLogger::Sample, this);
+    }
 }

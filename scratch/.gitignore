@@ -6,4 +6,5 @@
 !subdir/
 !scratch-simulator.cc
 !nr_v2x_ngsim_deepc.cc
+!nr_v2x_ngsim_deepc_pruning_notes.md
 !CMakeLists.txt

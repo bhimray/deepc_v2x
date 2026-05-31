@@ -17,6 +17,7 @@
 class CbrLogger
 {
   public:
+    void Setup(double windowS);
     void Setup(double windowS, double stepS, const std::string& filename);
     void SetEvaluationWindow(double startS, double endS);
     void SetNodeEvaluationFilter(std::function<bool(uint32_t, double)> filter);
@@ -77,5 +78,6 @@ class CbrLogger
     double m_step{0.1};
     double m_evalStartS{0.0};
     double m_evalEndS{-1.0};
+    bool m_writeCsv{false};
     std::ofstream m_out;
 };

@@ -244,7 +244,7 @@ COOLDOWN="${{COOLDOWN:-2}}"
 OUT="{cd}/tmp/fixed_baseline_open_loop_smoke"
 mkdir -p "$OUT/validation" "$OUT/plots"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=$SIM_TIME --warmup=$WARMUP --cooldown=$COOLDOWN --maxVehicles=$MAX_VEHICLES --seed=12345 --run=$RUN --useInputSchedule=false --txPower=$TX_POWER_DBM --fixedBeaconInterval=$BEACON_INTERVAL_S --kpiCsv=$OUT/kpi_timeseries.csv --cbrCsv=$OUT/cbr_timeseries.csv" | tee "$OUT/ns3.log"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=$SIM_TIME --warmup=$WARMUP --cooldown=$COOLDOWN --maxVehicles=$MAX_VEHICLES --seed=12345 --run=$RUN --useInputSchedule=false --txPower=$TX_POWER_DBM --fixedBeaconInterval=$BEACON_INTERVAL_S --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 "$PYTHON" scripts/plot_deepc_bridge_run.py "$OUT" --out-dir "$OUT/plots"
 """,
@@ -258,7 +258,7 @@ MOBILITY_CSV="${{MOBILITY_CSV:-{mobility_csv}}}"
 TRAIN_DIR="{cd}/01_training/prbs_training_250veh_run001"
 mkdir -p "$TRAIN_DIR"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=600 --maxVehicles={max_vehicles_arg} --seed=12345 --run=1 --kpiCsv=$TRAIN_DIR/kpi_timeseries.csv --cbrCsv=$TRAIN_DIR/cbr_timeseries.csv"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=600 --maxVehicles={max_vehicles_arg} --seed=12345 --run=1 --kpiCsv=$TRAIN_DIR/kpi_timeseries.csv"
 "$PYTHON" scripts/data_validation.py "$TRAIN_DIR/kpi_timeseries.csv" --out-dir "$TRAIN_DIR/validation"
 "$PYTHON" scripts/build_hankel_dataset.py --kpi-csv "$TRAIN_DIR/kpi_timeseries.csv" --out-dir "{cd}/01_training/deepc_dataset_dt0p1"
 "$PYTHON" scripts/export_deepc_matlab_data.py --dataset-dir "{cd}/01_training/deepc_dataset_dt0p1" --out "{cd}/01_training/deepc_dataset_dt0p1/matlab_deepc_data.mat"
@@ -274,7 +274,7 @@ RUN="${{1:?Usage: $0 RUN_NUMBER}}"
 OUT="{cd}/02_runs/prbs_open_loop/run_$RUN"
 mkdir -p "$OUT/logs" "$OUT/validation" "$OUT/plots"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --kpiCsv=$OUT/kpi_timeseries.csv --cbrCsv=$OUT/cbr_timeseries.csv" | tee "$OUT/logs/ns3.log"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 """,
         "run_fixed_baseline.sh": f"""#!/usr/bin/env bash
@@ -288,7 +288,7 @@ RUN="${{1:?Usage: $0 RUN_NUMBER}}"
 OUT="{cd}/02_runs/fixed_baseline/run_$RUN"
 mkdir -p "$OUT/logs" "$OUT/validation" "$OUT/plots"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=20 --fixedBeaconInterval=0.1 --kpiCsv=$OUT/kpi_timeseries.csv --cbrCsv=$OUT/cbr_timeseries.csv" | tee "$OUT/logs/ns3.log"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=20 --fixedBeaconInterval=0.1 --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 "$PYTHON" scripts/plot_deepc_bridge_run.py "$OUT"
 """,
