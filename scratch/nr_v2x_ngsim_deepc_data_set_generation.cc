@@ -32,6 +32,7 @@
 #include <cmath>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -72,7 +73,7 @@ struct InputCommand
 struct TxEvent
 {
     double timeS;
-    uint32_t txNodeId;
+    uint32_t txVehicleId;
     uint64_t seq;
     uint32_t eligibleRxCount;
     std::map<uint32_t, double> rxDistanceAtTxM;
@@ -81,8 +82,8 @@ struct TxEvent
 struct RxEvent
 {
     double timeS;
-    uint32_t txNodeId;
-    uint32_t rxNodeId;
+    uint32_t txVehicleId;
+    uint32_t rxVehicleId;
     uint64_t seq;
     double pirS;
 };
@@ -106,24 +107,27 @@ class KpiPacketTag : public Tag
 
     uint32_t GetSerializedSize() const override
     {
-        return 16;
+        return 20;
     }
 
     void Serialize(TagBuffer i) const override
     {
         i.WriteU64(m_sequence);
         i.WriteU64(static_cast<uint64_t>(m_txTimeNs));
+        i.WriteU32(m_txVehicleId);
     }
 
     void Deserialize(TagBuffer i) override
     {
         m_sequence = i.ReadU64();
         m_txTimeNs = static_cast<int64_t>(i.ReadU64());
+        m_txVehicleId = i.ReadU32();
     }
 
     void Print(std::ostream& os) const override
     {
-        os << "sequence=" << m_sequence << ",txTimeNs=" << m_txTimeNs;
+        os << "sequence=" << m_sequence << ",txTimeNs=" << m_txTimeNs
+           << ",txVehicleId=" << m_txVehicleId;
     }
 
     void SetSequence(uint64_t sequence)
@@ -146,10 +150,25 @@ class KpiPacketTag : public Tag
         return m_txTimeNs;
     }
 
+    void SetTxVehicleId(uint32_t vehicleId)
+    {
+        m_txVehicleId = vehicleId;
+    }
+
+    uint32_t GetTxVehicleId() const
+    {
+        return m_txVehicleId;
+    }
+
   private:
     uint64_t m_sequence = 0;
     int64_t m_txTimeNs = 0;
+    uint32_t m_txVehicleId = std::numeric_limits<uint32_t>::max();
 };
+
+static constexpr uint32_t kInvalidVehicleId = std::numeric_limits<uint32_t>::max();
+static constexpr uint32_t kMaxPhysicalUePoolSize = 250;
+static constexpr double kAssignmentEpsS = 1e-6;
 
 static std::map<uint32_t, std::vector<MobilityRow>> g_mobilityByVehicle;
 static std::vector<InputCommand> g_inputSchedule;
@@ -158,6 +177,10 @@ static std::map<uint32_t, uint32_t> g_vehicleIdToNodeId;
 static std::map<uint32_t, uint32_t> g_nodeIdToVehicleId;
 static std::map<uint32_t, Ptr<Node>> g_nodeIdToNode;
 static std::map<uint32_t, std::pair<double, double>> g_nodeIdToActiveTimeRangeS;
+static std::map<uint32_t, Ptr<class NgsimPoolMobilityModel>> g_nodeIdToPoolMobility;
+static std::deque<uint32_t> g_freePoolNodeIds;
+static std::set<uint32_t> g_activeVehicleIds;
+static bool g_dynamicActivePoolEnabled = false;
 
 /****************************************************************
  * Helpers
@@ -206,9 +229,41 @@ IsInsideCoreRegion(double coordinate, double coreMin, double coreMax)
     return coordinate >= coreMin && coordinate <= coreMax;
 }
 
+static Vector
+GetInactiveParkingPosition(uint32_t nodeId)
+{
+    return Vector(-10000.0 - static_cast<double>(nodeId), -10000.0, 0.0);
+}
+
+static uint32_t
+ResolveVehicleIdForNode(uint32_t nodeId)
+{
+    auto it = g_nodeIdToVehicleId.find(nodeId);
+    return (it == g_nodeIdToVehicleId.end()) ? kInvalidVehicleId : it->second;
+}
+
+static uint32_t
+ResolveNodeIdForVehicle(uint32_t vehicleId)
+{
+    auto it = g_vehicleIdToNodeId.find(vehicleId);
+    return (it == g_vehicleIdToNodeId.end()) ? std::numeric_limits<uint32_t>::max() : it->second;
+}
+
+static bool
+IsNodeAssignedToVehicle(uint32_t nodeId, uint32_t vehicleId)
+{
+    return ResolveVehicleIdForNode(nodeId) == vehicleId;
+}
+
 static bool
 IsNodeActiveAtTime(uint32_t nodeId, double timeS)
 {
+    if (g_dynamicActivePoolEnabled)
+    {
+        (void)timeS;
+        return ResolveVehicleIdForNode(nodeId) != kInvalidVehicleId;
+    }
+
     auto it = g_nodeIdToActiveTimeRangeS.find(nodeId);
     if (it == g_nodeIdToActiveTimeRangeS.end())
     {
@@ -247,6 +302,49 @@ ComputeMobilityTimeRangeForVehicles(const std::vector<uint32_t>& vehicleIds)
     NS_ABORT_MSG_IF(!std::isfinite(minTimeS) || !std::isfinite(maxTimeS),
                     "Cannot compute selected mobility coverage from empty vehicle set");
     return {minTimeS, maxTimeS};
+}
+
+static std::pair<uint32_t, uint32_t>
+ComputePeakActiveCountsForVehicles(const std::vector<uint32_t>& vehicleIds,
+                                   bool enableCoreFilter,
+                                   const std::string& coreAxis,
+                                   double coreMin,
+                                   double coreMax)
+{
+    std::map<double, std::set<uint32_t>> activeByTime;
+    std::map<double, std::set<uint32_t>> coreByTime;
+
+    for (uint32_t vehicleId : vehicleIds)
+    {
+        const auto vehIt = g_mobilityByVehicle.find(vehicleId);
+        if (vehIt == g_mobilityByVehicle.end())
+        {
+            continue;
+        }
+        for (const auto& row : vehIt->second)
+        {
+            activeByTime[row.timeS].insert(vehicleId);
+            if (!enableCoreFilter ||
+                IsInsideCoreRegion((coreAxis == "x") ? row.xM : row.yM, coreMin, coreMax))
+            {
+                coreByTime[row.timeS].insert(vehicleId);
+            }
+        }
+    }
+
+    uint32_t peakActive = 0;
+    for (const auto& kv : activeByTime)
+    {
+        peakActive = std::max<uint32_t>(peakActive, kv.second.size());
+    }
+
+    uint32_t peakCore = 0;
+    for (const auto& kv : coreByTime)
+    {
+        peakCore = std::max<uint32_t>(peakCore, kv.second.size());
+    }
+
+    return {peakActive, peakCore};
 }
 
 static std::pair<double, double>
@@ -348,6 +446,158 @@ GetCoreCoordinate(const Vector& position, const std::string& axis)
     return (axis == "x") ? position.x : position.y;
 }
 
+class NgsimPoolMobilityModel : public MobilityModel
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::NgsimPoolMobilityModel")
+                                .SetParent<MobilityModel>()
+                                .SetGroupName("Mobility")
+                                .AddConstructor<NgsimPoolMobilityModel>();
+        return tid;
+    }
+
+    void SetParkingPosition(const Vector& position)
+    {
+        m_parkingPosition = position;
+        if (!m_rows)
+        {
+            NotifyCourseChange();
+        }
+    }
+
+    void AssignVehicle(uint32_t vehicleId, const std::vector<MobilityRow>* rows)
+    {
+        NS_ABORT_MSG_IF(rows == nullptr || rows->empty(),
+                        "Cannot assign pool mobility to an empty vehicle track");
+        m_vehicleId = vehicleId;
+        m_rows = rows;
+        m_lastIndex = 0;
+        NotifyCourseChange();
+    }
+
+    void ReleaseVehicle()
+    {
+        m_vehicleId = kInvalidVehicleId;
+        m_rows = nullptr;
+        m_lastIndex = 0;
+        NotifyCourseChange();
+    }
+
+    bool IsAssigned() const
+    {
+        return m_rows != nullptr;
+    }
+
+    uint32_t GetVehicleId() const
+    {
+        return m_vehicleId;
+    }
+
+  private:
+    Vector InterpolatePosition(double timeS) const
+    {
+        if (!m_rows || m_rows->empty())
+        {
+            return m_parkingPosition;
+        }
+
+        const auto& rows = *m_rows;
+        if (timeS <= rows.front().timeS)
+        {
+            return Vector(rows.front().xM, rows.front().yM, 0.0);
+        }
+        if (timeS >= rows.back().timeS)
+        {
+            return Vector(rows.back().xM, rows.back().yM, 0.0);
+        }
+
+        while (m_lastIndex + 1 < rows.size() && rows[m_lastIndex + 1].timeS <= timeS)
+        {
+            m_lastIndex++;
+        }
+        while (m_lastIndex > 0 && rows[m_lastIndex].timeS > timeS)
+        {
+            m_lastIndex--;
+        }
+
+        const uint32_t nextIndex = std::min<uint32_t>(m_lastIndex + 1, rows.size() - 1);
+        const auto& a = rows[m_lastIndex];
+        const auto& b = rows[nextIndex];
+        const double dt = b.timeS - a.timeS;
+        if (dt <= 0.0)
+        {
+            return Vector(a.xM, a.yM, 0.0);
+        }
+        const double alpha = std::max(0.0, std::min(1.0, (timeS - a.timeS) / dt));
+        return Vector(a.xM + alpha * (b.xM - a.xM), a.yM + alpha * (b.yM - a.yM), 0.0);
+    }
+
+    Vector InterpolateVelocity(double timeS) const
+    {
+        if (!m_rows || m_rows->empty())
+        {
+            return Vector(0.0, 0.0, 0.0);
+        }
+
+        const auto& rows = *m_rows;
+        if (timeS <= rows.front().timeS)
+        {
+            return Vector(rows.front().vxMps, rows.front().vyMps, 0.0);
+        }
+        if (timeS >= rows.back().timeS)
+        {
+            return Vector(rows.back().vxMps, rows.back().vyMps, 0.0);
+        }
+
+        while (m_lastIndex + 1 < rows.size() && rows[m_lastIndex + 1].timeS <= timeS)
+        {
+            m_lastIndex++;
+        }
+        while (m_lastIndex > 0 && rows[m_lastIndex].timeS > timeS)
+        {
+            m_lastIndex--;
+        }
+
+        const uint32_t nextIndex = std::min<uint32_t>(m_lastIndex + 1, rows.size() - 1);
+        const auto& a = rows[m_lastIndex];
+        const auto& b = rows[nextIndex];
+        const double dt = b.timeS - a.timeS;
+        if (dt <= 0.0)
+        {
+            return Vector(a.vxMps, a.vyMps, 0.0);
+        }
+        const double alpha = std::max(0.0, std::min(1.0, (timeS - a.timeS) / dt));
+        return Vector(a.vxMps + alpha * (b.vxMps - a.vxMps),
+                      a.vyMps + alpha * (b.vyMps - a.vyMps),
+                      0.0);
+    }
+
+    Vector DoGetPosition() const override
+    {
+        return InterpolatePosition(Simulator::Now().GetSeconds());
+    }
+
+    void DoSetPosition(const Vector& position) override
+    {
+        m_parkingPosition = position;
+        NotifyCourseChange();
+    }
+
+    Vector DoGetVelocity() const override
+    {
+        return InterpolateVelocity(Simulator::Now().GetSeconds());
+    }
+
+    uint32_t m_vehicleId = kInvalidVehicleId;
+    const std::vector<MobilityRow>* m_rows = nullptr;
+    mutable uint32_t m_lastIndex = 0;
+    Vector m_parkingPosition = Vector(0.0, 0.0, 0.0);
+};
+
+NS_OBJECT_ENSURE_REGISTERED(NgsimPoolMobilityModel);
+
 static void
 LoadMobilityCsv(const std::string& path)
 {
@@ -396,6 +646,15 @@ LoadMobilityCsv(const std::string& path)
         row.laneId = static_cast<uint32_t>(std::stoul(token));
 
         g_mobilityByVehicle[row.vehicleId].push_back(row);
+    }
+
+    for (auto& kv : g_mobilityByVehicle)
+    {
+        std::sort(kv.second.begin(),
+                  kv.second.end(),
+                  [](const MobilityRow& a, const MobilityRow& b) {
+                      return a.timeS < b.timeS;
+                  });
     }
 
     std::cout << "Loaded vehicles from mobility CSV: " << g_mobilityByVehicle.size() << std::endl;
@@ -447,10 +706,7 @@ InstallWaypointMobility(Ptr<Node> node, const std::vector<MobilityRow>& rows)
     Ptr<WaypointMobilityModel> mob = CreateObject<WaypointMobilityModel>();
     node->AggregateObject(mob);
 
-    const Vector inactiveParkingPosition(
-        -10000.0 - static_cast<double>(node->GetId()),
-        -10000.0,
-        0.0);
+    const Vector inactiveParkingPosition = GetInactiveParkingPosition(node->GetId());
     constexpr double waypointEpsS = 1e-6;
 
     if (rows.front().timeS > 0.0)
@@ -571,10 +827,11 @@ class KpiLogger : public Object
         m_currentTb = tbS;
     }
 
-    void LogTx(uint32_t txNodeId, uint64_t seq, Time tTx, const Vector& posTx)
+    void LogTx(uint32_t txVehicleId, uint32_t txNodeId, uint64_t seq, Time tTx, const Vector& posTx)
     {
         const double timeS = tTx.GetSeconds();
-        if (!IsNodeActiveAtTime(txNodeId, timeS) || !IsInsideEvaluationWindow(timeS) ||
+        if (txVehicleId == kInvalidVehicleId || !IsNodeActiveAtTime(txNodeId, timeS) ||
+            !IsNodeAssignedToVehicle(txNodeId, txVehicleId) || !IsInsideEvaluationWindow(timeS) ||
             !IsInsideCore(posTx))
         {
             return;
@@ -592,6 +849,11 @@ class KpiLogger : public Object
             {
                 continue;
             }
+            const uint32_t rxVehicleId = ResolveVehicleIdForNode(node->GetId());
+            if (rxVehicleId == kInvalidVehicleId || rxVehicleId == txVehicleId)
+            {
+                continue;
+            }
 
             Vector posRx = node->GetObject<MobilityModel>()->GetPosition();
             if (!IsInsideCore(posRx))
@@ -602,13 +864,13 @@ class KpiLogger : public Object
             const double distanceM = Distance2d(posTx, posRx);
             if (distanceM <= m_awarenessRangeM)
             {
-                rxDistanceAtTxM[node->GetId()] = distanceM;
+                rxDistanceAtTxM[rxVehicleId] = distanceM;
             }
         }
 
         TxEvent ev;
         ev.timeS = timeS;
-        ev.txNodeId = txNodeId;
+        ev.txVehicleId = txVehicleId;
         ev.seq = seq;
         ev.eligibleRxCount = static_cast<uint32_t>(rxDistanceAtTxM.size());
         ev.rxDistanceAtTxM = rxDistanceAtTxM;
@@ -618,20 +880,25 @@ class KpiLogger : public Object
         PruneOldEvents();
     }
 
-    void LogRx(uint32_t txNodeId,
-           uint32_t rxNodeId,
+    void LogRx(uint32_t txVehicleId,
+           uint32_t rxVehicleId,
            uint64_t seq,
            Time tRx,
            const Vector& posRx)
     {
         const double timeS = tRx.GetSeconds();
-        if (!IsInsideEvaluationWindow(timeS) || !IsNodeActiveAtTime(txNodeId, timeS) ||
-            !IsNodeActiveAtTime(rxNodeId, timeS))
+        const uint32_t txNodeId = ResolveNodeIdForVehicle(txVehicleId);
+        const uint32_t rxNodeId = ResolveNodeIdForVehicle(rxVehicleId);
+        if (!IsInsideEvaluationWindow(timeS) || txNodeId == std::numeric_limits<uint32_t>::max() ||
+            rxNodeId == std::numeric_limits<uint32_t>::max() ||
+            !IsNodeActiveAtTime(txNodeId, timeS) || !IsNodeActiveAtTime(rxNodeId, timeS) ||
+            !IsNodeAssignedToVehicle(txNodeId, txVehicleId) ||
+            !IsNodeAssignedToVehicle(rxNodeId, rxVehicleId))
         {
             return;
         }
 
-        const TxEvent* txEvent = FindTxEvent(txNodeId, seq);
+        const TxEvent* txEvent = FindTxEvent(txVehicleId, seq);
         if (!txEvent)
         {
             return;
@@ -641,13 +908,13 @@ class KpiLogger : public Object
         {
             return;
         }
-        auto distIt = txEvent->rxDistanceAtTxM.find(rxNodeId);
+        auto distIt = txEvent->rxDistanceAtTxM.find(rxVehicleId);
         if (distIt == txEvent->rxDistanceAtTxM.end())
         {
             return;
         }
 
-        auto rxTriple = std::make_tuple(txNodeId, rxNodeId, seq);
+        auto rxTriple = std::make_tuple(txVehicleId, rxVehicleId, seq);
         if (m_loggedRxTriples.find(rxTriple) != m_loggedRxTriples.end())
         {
             return;
@@ -655,7 +922,7 @@ class KpiLogger : public Object
         m_loggedRxTriples.insert(rxTriple);
 
         double pir = std::numeric_limits<double>::quiet_NaN();
-        auto key = std::make_pair(txNodeId, rxNodeId);
+        auto key = std::make_pair(txVehicleId, rxVehicleId);
 
         auto it = m_lastRxTimePerPair.find(key);
         if (it != m_lastRxTimePerPair.end())
@@ -666,8 +933,8 @@ class KpiLogger : public Object
 
         RxEvent ev;
         ev.timeS = timeS;
-        ev.txNodeId = txNodeId;
-        ev.rxNodeId = rxNodeId;
+        ev.txVehicleId = txVehicleId;
+        ev.rxVehicleId = rxVehicleId;
         ev.seq = seq;
         ev.pirS = pir;
 
@@ -687,15 +954,15 @@ class KpiLogger : public Object
         for (const auto& tx : m_txEvents)
         {
             denom += tx.eligibleRxCount;
-            activeTxKeys.insert(std::make_tuple(tx.txNodeId, tx.seq));
+            activeTxKeys.insert(std::make_tuple(tx.txVehicleId, tx.seq));
         }
 
         std::set<std::tuple<uint32_t, uint32_t, uint64_t>> uniqueRxTriples;
         for (const auto& rx : m_rxEvents)
         {
-            if (activeTxKeys.find(std::make_tuple(rx.txNodeId, rx.seq)) != activeTxKeys.end())
+            if (activeTxKeys.find(std::make_tuple(rx.txVehicleId, rx.seq)) != activeTxKeys.end())
             {
-                uniqueRxTriples.insert(std::make_tuple(rx.txNodeId, rx.rxNodeId, rx.seq));
+                uniqueRxTriples.insert(std::make_tuple(rx.txVehicleId, rx.rxVehicleId, rx.seq));
             }
         }
 
@@ -747,6 +1014,10 @@ class KpiLogger : public Object
             {
                 continue;
             }
+            if (ResolveVehicleIdForNode(node->GetId()) == kInvalidVehicleId)
+            {
+                continue;
+            }
             const Vector pos = node->GetObject<MobilityModel>()->GetPosition();
             if (IsInsideCore(pos))
             {
@@ -778,12 +1049,12 @@ class KpiLogger : public Object
         }
         for (const auto& tx : m_txEvents)
         {
-            activeTxKeys.insert(std::make_tuple(tx.txNodeId, tx.seq));
+            activeTxKeys.insert(std::make_tuple(tx.txVehicleId, tx.seq));
         }
         while (!m_rxEvents.empty() && m_rxEvents.front().timeS < cutoff)
         {
-            m_loggedRxTriples.erase(std::make_tuple(m_rxEvents.front().txNodeId,
-                                                    m_rxEvents.front().rxNodeId,
+            m_loggedRxTriples.erase(std::make_tuple(m_rxEvents.front().txVehicleId,
+                                                    m_rxEvents.front().rxVehicleId,
                                                     m_rxEvents.front().seq));
             m_rxEvents.pop_front();
         }
@@ -791,14 +1062,14 @@ class KpiLogger : public Object
                                         m_rxEvents.end(),
                                         [this, &activeTxKeys](const RxEvent& rx) {
                                             const auto txKey =
-                                                std::make_tuple(rx.txNodeId, rx.seq);
+                                                std::make_tuple(rx.txVehicleId, rx.seq);
                                             if (activeTxKeys.find(txKey) != activeTxKeys.end())
                                             {
                                                 return false;
                                             }
 
-                                            m_loggedRxTriples.erase(std::make_tuple(rx.txNodeId,
-                                                                                    rx.rxNodeId,
+                                            m_loggedRxTriples.erase(std::make_tuple(rx.txVehicleId,
+                                                                                    rx.rxVehicleId,
                                                                                     rx.seq));
                                             return true;
                                         }),
@@ -816,11 +1087,11 @@ class KpiLogger : public Object
                IsInsideCoreRegion(GetCoreCoordinate(position, m_coreAxis), m_coreMin, m_coreMax);
     }
 
-    const TxEvent* FindTxEvent(uint32_t txNodeId, uint64_t seq) const
+    const TxEvent* FindTxEvent(uint32_t txVehicleId, uint64_t seq) const
     {
         for (auto it = m_txEvents.rbegin(); it != m_txEvents.rend(); ++it)
         {
-            if (it->txNodeId == txNodeId && it->seq == seq)
+            if (it->txVehicleId == txVehicleId && it->seq == seq)
             {
                 return &(*it);
             }
@@ -1088,6 +1359,28 @@ class CamApplication : public Application
         m_useEtsiCamGeneration = enable;
     }
 
+    void AssignVehicle(uint32_t vehicleId)
+    {
+        m_assignedVehicleId = vehicleId;
+        if (m_running)
+        {
+            ConfigureVehicleServiceState();
+            StartCamIfReady();
+        }
+    }
+
+    void ReleaseVehicle()
+    {
+        StopCamIfRunning();
+        m_assignedVehicleId = kInvalidVehicleId;
+        m_vdp.reset();
+    }
+
+    uint32_t GetAssignedVehicleId() const
+    {
+        return m_assignedVehicleId;
+    }
+
   protected:
     void StartApplication() override
     {
@@ -1113,8 +1406,7 @@ class CamApplication : public Application
         m_btp->setGeoNet(m_geoNet);
 
         m_caService.setBTP(m_btp);
-        m_caService.setVDP(m_vdp.get());
-        m_btp->setVDP(m_vdp.get());
+        ConfigureVehicleServiceState();
         m_caService.setStationProperties(m_node->GetId(), StationType_passengerCar);
         m_caService.setRealTime(false);
         m_caService.setSocketTx(m_socket);
@@ -1128,14 +1420,13 @@ class CamApplication : public Application
                       std::placeholders::_2,
                       std::placeholders::_3));
 
-        const double desyncS = GetDeterministicDesync();
-        m_caService.startCamDissemination(desyncS);
+        StartCamIfReady();
     }
 
     void StopApplication() override
     {
         m_running = false;
-        m_caService.terminateDissemination();
+        StopCamIfRunning();
 
         if (m_socket)
         {
@@ -1147,7 +1438,7 @@ class CamApplication : public Application
   private:
     void TagAndLogTx(Ptr<Packet> packet)
     {
-        if (!m_running || !packet)
+        if (!m_running || m_assignedVehicleId == kInvalidVehicleId || !packet)
         {
             return;
         }
@@ -1156,21 +1447,24 @@ class CamApplication : public Application
         KpiPacketTag kpiTag;
         kpiTag.SetSequence(kpiSeq);
         kpiTag.SetTxTimeNs(Simulator::Now().GetNanoSeconds());
+        kpiTag.SetTxVehicleId(m_assignedVehicleId);
         packet->AddPacketTag(kpiTag);
 
         Vector pos = m_node->GetObject<MobilityModel>()->GetPosition();
-        m_logger->LogTx(m_node->GetId(), kpiSeq, Simulator::Now(), pos);
+        m_logger->LogTx(m_assignedVehicleId, m_node->GetId(), kpiSeq, Simulator::Now(), pos);
     }
 
     double GetDeterministicDesync() const
     {
-        const double fractional = std::fmod((m_node->GetId() + 1) * 0.6180339887498948, 1.0);
+        const uint32_t identity =
+            (m_assignedVehicleId == kInvalidVehicleId) ? m_node->GetId() : m_assignedVehicleId;
+        const double fractional = std::fmod((identity + 1) * 0.6180339887498948, 1.0);
         return fractional * std::max(0.1, m_tGenCamMaxS);
     }
 
     void ReceiveCam(asn1cpp::Seq<CAM> cam, Address from, Ptr<Packet> packet)
     {
-        if (!packet || packet->GetSize() == 0)
+        if (m_assignedVehicleId == kInvalidVehicleId || !packet || packet->GetSize() == 0)
         {
             return;
         }
@@ -1189,20 +1483,62 @@ class CamApplication : public Application
             return;
         }
         const uint64_t kpiSeq = kpiTag.GetSequence();
+        const uint32_t txVehicleId = kpiTag.GetTxVehicleId();
         const uint32_t stationId = asn1cpp::getField(cam->header.stationId, uint32_t);
 
-        if (stationId != txNodeId)
+        if (txVehicleId == kInvalidVehicleId || stationId != txVehicleId ||
+            !IsNodeAssignedToVehicle(txNodeId, txVehicleId))
         {
             return;
         }
 
         Vector posRx = m_node->GetObject<MobilityModel>()->GetPosition();
 
-        m_logger->LogRx(txNodeId,
-                        m_node->GetId(),
+        m_logger->LogRx(txVehicleId,
+                        m_assignedVehicleId,
                         kpiSeq,
                         Simulator::Now(),
                         posRx);
+    }
+
+    void ConfigureVehicleServiceState()
+    {
+        if (!m_btp || !m_geoNet)
+        {
+            return;
+        }
+
+        m_vdp = std::make_unique<NgsimVehicleDataProvider>(m_node);
+        m_caService.setVDP(m_vdp.get());
+        m_btp->setVDP(m_vdp.get());
+
+        const uint32_t stationId =
+            (m_assignedVehicleId == kInvalidVehicleId) ? m_node->GetId() : m_assignedVehicleId;
+        m_caService.setStationProperties(stationId, StationType_passengerCar);
+    }
+
+    void StartCamIfReady()
+    {
+        if (!m_running || m_disseminating || m_assignedVehicleId == kInvalidVehicleId)
+        {
+            return;
+        }
+
+        m_caService.setStationProperties(m_assignedVehicleId, StationType_passengerCar);
+        const double desyncS = GetDeterministicDesync();
+        m_caService.startCamDissemination(desyncS);
+        m_disseminating = true;
+    }
+
+    void StopCamIfRunning()
+    {
+        if (!m_disseminating)
+        {
+            return;
+        }
+
+        m_caService.terminateDissemination();
+        m_disseminating = false;
     }
 
     Ptr<Node> m_node;
@@ -1214,7 +1550,9 @@ class CamApplication : public Application
     std::unique_ptr<NgsimVehicleDataProvider> m_vdp;
 
     bool m_running = false;
+    bool m_disseminating = false;
     bool m_useEtsiCamGeneration = true;
+    uint32_t m_assignedVehicleId = kInvalidVehicleId;
 
     double m_tGenCamMaxS = 1.0;
 
@@ -1225,6 +1563,106 @@ class CamApplication : public Application
 };
 
 static std::map<uint32_t, Ptr<CamApplication>> g_apps;
+
+static void
+AssignVehicleToPool(uint32_t vehicleId)
+{
+    NS_ABORT_MSG_IF(!g_dynamicActivePoolEnabled,
+                    "AssignVehicleToPool called while dynamic active pool is disabled");
+    NS_ABORT_MSG_IF(g_vehicleIdToNodeId.find(vehicleId) != g_vehicleIdToNodeId.end(),
+                    "Vehicle " << vehicleId << " is already assigned to a pool UE");
+    NS_ABORT_MSG_IF(g_freePoolNodeIds.empty(),
+                    "Dynamic active pool exhausted while assigning vehicle "
+                        << vehicleId << ". Increase --physicalUePoolSize.");
+
+    auto rowsIt = g_mobilityByVehicle.find(vehicleId);
+    NS_ABORT_MSG_IF(rowsIt == g_mobilityByVehicle.end() || rowsIt->second.empty(),
+                    "Cannot assign missing/empty mobility track for vehicle " << vehicleId);
+
+    const uint32_t nodeId = g_freePoolNodeIds.front();
+    g_freePoolNodeIds.pop_front();
+
+    auto mobilityIt = g_nodeIdToPoolMobility.find(nodeId);
+    NS_ABORT_MSG_IF(mobilityIt == g_nodeIdToPoolMobility.end() || !mobilityIt->second,
+                    "Missing pool mobility model for node " << nodeId);
+
+    g_vehicleIdToNodeId[vehicleId] = nodeId;
+    g_nodeIdToVehicleId[nodeId] = vehicleId;
+    g_activeVehicleIds.insert(vehicleId);
+    mobilityIt->second->AssignVehicle(vehicleId, &rowsIt->second);
+
+    auto appIt = g_apps.find(nodeId);
+    if (appIt != g_apps.end() && appIt->second)
+    {
+        appIt->second->AssignVehicle(vehicleId);
+    }
+}
+
+static void
+ReleaseVehicleFromPool(uint32_t vehicleId)
+{
+    NS_ABORT_MSG_IF(!g_dynamicActivePoolEnabled,
+                    "ReleaseVehicleFromPool called while dynamic active pool is disabled");
+
+    auto assignedIt = g_vehicleIdToNodeId.find(vehicleId);
+    if (assignedIt == g_vehicleIdToNodeId.end())
+    {
+        return;
+    }
+
+    const uint32_t nodeId = assignedIt->second;
+    auto appIt = g_apps.find(nodeId);
+    if (appIt != g_apps.end() && appIt->second)
+    {
+        appIt->second->ReleaseVehicle();
+    }
+
+    auto mobilityIt = g_nodeIdToPoolMobility.find(nodeId);
+    if (mobilityIt != g_nodeIdToPoolMobility.end() && mobilityIt->second)
+    {
+        mobilityIt->second->ReleaseVehicle();
+    }
+
+    g_vehicleIdToNodeId.erase(assignedIt);
+    g_nodeIdToVehicleId.erase(nodeId);
+    g_activeVehicleIds.erase(vehicleId);
+    g_freePoolNodeIds.push_back(nodeId);
+}
+
+static void
+AssignInitialDynamicPoolVehicles(const std::vector<uint32_t>& vehicleIds, double initialTimeS)
+{
+    for (uint32_t vehicleId : vehicleIds)
+    {
+        const auto range = ComputeMobilityTimeRange(g_mobilityByVehicle[vehicleId]);
+        if (range.first <= initialTimeS + kAssignmentEpsS &&
+            range.second + kAssignmentEpsS >= initialTimeS)
+        {
+            AssignVehicleToPool(vehicleId);
+        }
+    }
+}
+
+static void
+ScheduleDynamicPoolAssignments(const std::vector<uint32_t>& vehicleIds,
+                               double initialTimeS,
+                               double simTimeSeconds)
+{
+    for (uint32_t vehicleId : vehicleIds)
+    {
+        const auto range = ComputeMobilityTimeRange(g_mobilityByVehicle[vehicleId]);
+        if (range.first > initialTimeS + kAssignmentEpsS && range.first <= simTimeSeconds)
+        {
+            Simulator::Schedule(Seconds(range.first), &AssignVehicleToPool, vehicleId);
+        }
+
+        const double releaseTimeS = range.second + kAssignmentEpsS;
+        if (releaseTimeS > initialTimeS + kAssignmentEpsS && releaseTimeS <= simTimeSeconds)
+        {
+            Simulator::Schedule(Seconds(releaseTimeS), &ReleaseVehicleFromPool, vehicleId);
+        }
+    }
+}
 
 static void
 ApplyTxPowerToAllUes(const NetDeviceContainer& ueDevs, double pDbm)
@@ -1390,7 +1828,12 @@ WriteMetadataJson(const std::string& kpiCsv,
                   uint16_t t1,
                   uint16_t t2,
                   int slThresPsschRsrp,
-                  uint32_t vehicleCount,
+                  uint32_t logicalVehicleCount,
+                  uint32_t physicalVehicleCount,
+                  bool dynamicActivePool,
+                  uint32_t physicalUePoolSize,
+                  uint32_t peakActiveVehicles,
+                  uint32_t peakCoreVehicles,
                   uint32_t seed,
                   uint32_t run)
 {
@@ -1448,7 +1891,12 @@ WriteMetadataJson(const std::string& kpiCsv,
         << "  \"t1_slots\": " << t1 << ",\n"
         << "  \"t2_slots\": " << t2 << ",\n"
         << "  \"sl_thres_pssch_rsrp_dbm\": " << slThresPsschRsrp << ",\n"
-        << "  \"vehicle_count\": " << vehicleCount << ",\n"
+        << "  \"logical_vehicle_count\": " << logicalVehicleCount << ",\n"
+        << "  \"physical_ue_count\": " << physicalVehicleCount << ",\n"
+        << "  \"dynamic_active_pool\": " << dynamicActivePool << ",\n"
+        << "  \"physical_ue_pool_size\": " << physicalUePoolSize << ",\n"
+        << "  \"peak_simultaneous_active_vehicles\": " << peakActiveVehicles << ",\n"
+        << "  \"peak_active_core_vehicles\": " << peakCoreVehicles << ",\n"
         << "  \"seed\": " << seed << ",\n"
         << "  \"run\": " << run << ",\n"
         << "  \"prr_definition\": \"unique successful Tx-Rx-seq receptions with TX-time distance <= "
@@ -1526,7 +1974,9 @@ main(int argc, char* argv[])
     double awarenessRangeM = 300.0;
     double kpiWindowS = 1.0;
     double sampleTimeS = 0.5;
-    uint32_t maxVehicles = 250; // 0 means all vehicles
+    bool dynamicActivePool = true;
+    uint32_t physicalUePoolSize = kMaxPhysicalUePoolSize;
+    uint32_t maxVehicles = 0; // 0 means all logical vehicles
     bool enableCoreFilter = true;
     std::string coreAxis = "auto";
     double coreGuardBandM = 120.0;
@@ -1557,7 +2007,15 @@ main(int argc, char* argv[])
     cmd.AddValue("awarenessRange", "PRR awareness range [m]", awarenessRangeM);
     cmd.AddValue("kpiWindow", "KPI sliding window [s]", kpiWindowS);
     cmd.AddValue("sampleTime", "KPI output sample time [s]", sampleTimeS);
-    cmd.AddValue("maxVehicles", "Maximum number of vehicles to simulate; 0 means all vehicles", maxVehicles);
+    cmd.AddValue("dynamicActivePool",
+                 "Use a bounded physical UE pool assigned to active logical NGSIM vehicles",
+                 dynamicActivePool);
+    cmd.AddValue("physicalUePoolSize",
+                 "Maximum number of physical NR UEs when dynamicActivePool=true",
+                 physicalUePoolSize);
+    cmd.AddValue("maxVehicles",
+                 "Maximum number of logical NGSIM vehicles to load; 0 means all vehicles",
+                 maxVehicles);
     cmd.AddValue("enableCoreFilter", "Filter KPI evaluation to the central corridor core", enableCoreFilter);
     cmd.AddValue("coreAxis", "Longitudinal coordinate for core filter: auto, x, or y", coreAxis);
     cmd.AddValue("coreGuardBand", "Guard band removed from each corridor edge [m]", coreGuardBandM);
@@ -1579,6 +2037,7 @@ main(int argc, char* argv[])
                     "warmup + cooldown must be smaller than simTime");
     RngSeedManager::SetSeed(seed);
     RngSeedManager::SetRun(run);
+    g_dynamicActivePoolEnabled = dynamicActivePool;
 
     // Load data
     LoadMobilityCsv(mobilityCsv);
@@ -1635,6 +2094,35 @@ main(int argc, char* argv[])
     {
         vehicleIds.resize(maxVehicles);
     }
+    const auto peakCounts = ComputePeakActiveCountsForVehicles(vehicleIds,
+                                                               enableCoreFilter,
+                                                               coreAxis,
+                                                               coreMin,
+                                                               coreMax);
+    const uint32_t peakActiveVehicles = peakCounts.first;
+    const uint32_t peakCoreVehicles = peakCounts.second;
+    const uint32_t physicalUeCount =
+        dynamicActivePool
+            ? std::min<uint32_t>(physicalUePoolSize, static_cast<uint32_t>(vehicleIds.size()))
+            : static_cast<uint32_t>(vehicleIds.size());
+    NS_ABORT_MSG_IF(vehicleIds.empty(), "No logical vehicles selected from mobility CSV");
+    NS_ABORT_MSG_IF(dynamicActivePool && physicalUePoolSize == 0,
+                    "physicalUePoolSize must be greater than zero when dynamicActivePool=true");
+    NS_ABORT_MSG_IF(dynamicActivePool && physicalUePoolSize > kMaxPhysicalUePoolSize,
+                    "physicalUePoolSize must be <= " << kMaxPhysicalUePoolSize
+                                                     << " for this experiment");
+    NS_ABORT_MSG_IF(dynamicActivePool && peakActiveVehicles > physicalUeCount,
+                    "Dynamic active pool exhausted by input data before simulation start: peak "
+                        << "simultaneous active vehicles = " << peakActiveVehicles
+                        << ", physical UE pool size = " << physicalUeCount
+                        << ". Increase --physicalUePoolSize.");
+
+    std::cout << "Logical NGSIM vehicles selected = " << vehicleIds.size() << std::endl;
+    std::cout << "Peak simultaneous active vehicles = " << peakActiveVehicles << std::endl;
+    std::cout << "Peak active core vehicles = " << peakCoreVehicles << std::endl;
+    std::cout << "Dynamic active pool = " << std::boolalpha << dynamicActivePool << std::endl;
+    std::cout << "Physical UEs to create = " << physicalUeCount << std::endl;
+
     ValidateTenMinuteDataCoverage(simTimeSeconds,
                                   evalStartS,
                                   evalEndS,
@@ -1656,25 +2144,42 @@ main(int argc, char* argv[])
         return 0;
     }
 
-    // Create nodes from vehicleIds and install mobility
+    // Create physical UE nodes and install either static per-vehicle mobility or reusable pool mobility.
     NodeContainer allSlUesContainer;
-    allSlUesContainer.Create(vehicleIds.size());
+    allSlUesContainer.Create(physicalUeCount);
 
-    for (uint32_t i = 0; i < vehicleIds.size(); ++i)
+    for (uint32_t i = 0; i < allSlUesContainer.GetN(); ++i)
     {
-        uint32_t vehicleId = vehicleIds[i];
         Ptr<Node> node = allSlUesContainer.Get(i);
-
-        g_vehicleIdToNodeId[vehicleId] = node->GetId();
-        g_nodeIdToVehicleId[node->GetId()] = vehicleId;
         g_nodeIdToNode[node->GetId()] = node;
-        g_nodeIdToActiveTimeRangeS[node->GetId()] =
-            ComputeMobilityTimeRange(g_mobilityByVehicle[vehicleId]);
 
-        InstallWaypointMobility(node, g_mobilityByVehicle[vehicleId]);
+        if (dynamicActivePool)
+        {
+            Ptr<NgsimPoolMobilityModel> mob = CreateObject<NgsimPoolMobilityModel>();
+            mob->SetParkingPosition(GetInactiveParkingPosition(node->GetId()));
+            node->AggregateObject(mob);
+            g_nodeIdToPoolMobility[node->GetId()] = mob;
+            g_freePoolNodeIds.push_back(node->GetId());
+        }
+        else
+        {
+            uint32_t vehicleId = vehicleIds[i];
+            g_vehicleIdToNodeId[vehicleId] = node->GetId();
+            g_nodeIdToVehicleId[node->GetId()] = vehicleId;
+            g_nodeIdToActiveTimeRangeS[node->GetId()] =
+                ComputeMobilityTimeRange(g_mobilityByVehicle[vehicleId]);
+
+            InstallWaypointMobility(node, g_mobilityByVehicle[vehicleId]);
+        }
+    }
+    if (dynamicActivePool)
+    {
+        AssignInitialDynamicPoolVehicles(vehicleIds, 0.0);
+        std::cout << "Initial active logical vehicles assigned = " << g_activeVehicleIds.size()
+                  << std::endl;
     }
 
-    std::cout << "Total UEs = " << allSlUesContainer.GetN() << std::endl;
+    std::cout << "Total physical UEs = " << allSlUesContainer.GetN() << std::endl;
 
     /**************** NR core + helper ****************/
     Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
@@ -1931,17 +2436,39 @@ main(int argc, char* argv[])
         app->SetEtsiCamGeneration(etsiCamGeneration);
         app->SetBeaconInterval(fixedBeaconIntervalS);
         node->AddApplication(app);
-        const auto activeRange = g_nodeIdToActiveTimeRangeS[node->GetId()];
-        const double appStartS =
-            std::max((slBearersActivationTime + camApplicationStartDelay).GetSeconds(),
-                     activeRange.first);
-        const double appStopS = std::min(simTimeSeconds, activeRange.second);
-        if (appStopS > appStartS)
+
+        const uint32_t assignedVehicleId = ResolveVehicleIdForNode(node->GetId());
+        if (assignedVehicleId != kInvalidVehicleId)
         {
+            app->AssignVehicle(assignedVehicleId);
+        }
+
+        if (dynamicActivePool)
+        {
+            const double appStartS = (slBearersActivationTime + camApplicationStartDelay).GetSeconds();
             app->SetStartTime(Seconds(appStartS));
-            app->SetStopTime(Seconds(appStopS));
+            app->SetStopTime(Seconds(simTimeSeconds));
             g_apps[node->GetId()] = app;
         }
+        else
+        {
+            const auto activeRange = g_nodeIdToActiveTimeRangeS[node->GetId()];
+            const double appStartS =
+                std::max((slBearersActivationTime + camApplicationStartDelay).GetSeconds(),
+                         activeRange.first);
+            const double appStopS = std::min(simTimeSeconds, activeRange.second);
+            if (appStopS > appStartS)
+            {
+                app->SetStartTime(Seconds(appStartS));
+                app->SetStopTime(Seconds(appStopS));
+                g_apps[node->GetId()] = app;
+            }
+        }
+    }
+
+    if (dynamicActivePool)
+    {
+        ScheduleDynamicPoolAssignments(vehicleIds, 0.0, simTimeSeconds);
     }
 
     /**************** Time-varying input schedule ****************/
@@ -1987,7 +2514,12 @@ main(int argc, char* argv[])
                       t1,
                       t2,
                       slThresPsschRsrp,
+                      static_cast<uint32_t>(vehicleIds.size()),
                       allSlUesContainer.GetN(),
+                      dynamicActivePool,
+                      physicalUePoolSize,
+                      peakActiveVehicles,
+                      peakCoreVehicles,
                       seed,
                       run);
 
