@@ -17,15 +17,18 @@ import pandas as pd
 
 
 DEFAULT_CAMPAIGN_DIR = Path("data/output/final/ieee_250veh_deepc_campaign_01")
-METHOD_ORDER = ["prbs_open_loop", "fixed_baseline", "threshold_dcc", "deepc_matlab"]
+METHOD_ORDER = ["prbs_open_loop", "fixed_10hz", "fixed_5hz", "threshold_dcc", "deepc_matlab"]
 METRICS = [
     "mean_prr_awareness",
+    "beacon_error_rate",
     "mean_pir_s",
     "mean_cbr",
     "cbr_gt_0p6_rate",
     "p95_delay_s",
     "mean_tx_power_dbm",
     "mean_beacon_interval_s",
+    "mean_active_vehicle_count_core",
+    "mean_density_veh_per_km_core",
     "mean_controller_solve_time_s",
     "controller_success_rate",
 ]
@@ -106,13 +109,17 @@ def compute_run_metrics(method: str, run_dir: Path) -> dict | None:
         "eval_start_s": start,
         "eval_end_s": end,
         "mean_prr_awareness": float(kpi_eval["prr_awareness"].mean()),
+        "beacon_error_rate": float((1.0 - kpi_eval["prr_awareness"]).mean()),
         "mean_pir_s": float(kpi_eval["pir_s"].mean()),
         "mean_cbr": float(kpi_eval["cbr"].mean()),
         "cbr_gt_0p6_rate": float((kpi_eval["cbr"] > 0.6).mean()),
         "mean_tx_power_dbm": float(kpi_eval["tx_power_dbm"].mean()),
         "mean_beacon_interval_s": float(kpi_eval["beacon_interval_s"].mean()),
-        "mean_density_veh_per_km_core": float(kpi_eval["density_veh_per_km_core"].mean()),
     }
+    if "active_vehicle_count_core" in kpi_eval:
+        row["mean_active_vehicle_count_core"] = float(kpi_eval["active_vehicle_count_core"].mean())
+    if "density_veh_per_km_core" in kpi_eval:
+        row["mean_density_veh_per_km_core"] = float(kpi_eval["density_veh_per_km_core"].mean())
 
     rx_path = run_dir / "kpi_timeseries_rx_packet_log.csv"
     if rx_path.exists():
@@ -135,6 +142,58 @@ def compute_run_metrics(method: str, run_dir: Path) -> dict | None:
         row["mean_bridge_wait_time_s"] = float(timing["wait_time_s"].mean())
 
     return row
+
+
+def add_density_bins(kpi: pd.DataFrame) -> pd.DataFrame:
+    kpi = kpi.copy()
+    active = kpi["active_vehicle_count_core"]
+    if active.nunique() >= 3:
+        kpi["density_bin"] = pd.qcut(
+            active,
+            q=3,
+            labels=["low", "medium", "high"],
+            duplicates="drop",
+        )
+    else:
+        kpi["density_bin"] = "all"
+    return kpi
+
+
+def compute_density_bin_metrics(method: str, run_dir: Path) -> list[dict]:
+    kpi_path = run_dir / "kpi_timeseries.csv"
+    if not kpi_path.exists():
+        return []
+    metadata = load_json(run_dir / "kpi_timeseries_metadata.json")
+    kpi = add_prr_alias(pd.read_csv(kpi_path))
+    if "active_vehicle_count_core" not in kpi:
+        return []
+    start, end = eval_window(metadata, kpi)
+    kpi_eval = filter_eval(kpi, start, end)
+    if kpi_eval.empty:
+        return []
+
+    rows = []
+    kpi_eval = add_density_bins(kpi_eval)
+    for density_bin, group in kpi_eval.groupby("density_bin", observed=True):
+        rows.append(
+            {
+                "method": method,
+                "run": run_number(run_dir),
+                "density_bin": str(density_bin),
+                "rows": int(len(group)),
+                "active_vehicle_count_min": float(group["active_vehicle_count_core"].min()),
+                "active_vehicle_count_mean": float(group["active_vehicle_count_core"].mean()),
+                "active_vehicle_count_max": float(group["active_vehicle_count_core"].max()),
+                "mean_prr_awareness": float(group["prr_awareness"].mean()),
+                "beacon_error_rate": float((1.0 - group["prr_awareness"]).mean()),
+                "mean_pir_s": float(group["pir_s"].mean()),
+                "mean_cbr": float(group["cbr"].mean()),
+                "cbr_gt_0p6_rate": float((group["cbr"] > 0.6).mean()),
+                "mean_tx_power_dbm": float(group["tx_power_dbm"].mean()),
+                "mean_beacon_interval_s": float(group["beacon_interval_s"].mean()),
+            }
+        )
+    return rows
 
 
 def aggregate(run_metrics: pd.DataFrame) -> pd.DataFrame:
@@ -184,15 +243,38 @@ def plot_metric(agg: pd.DataFrame, metric: str, out_dir: Path, ylabel: str) -> N
 def write_plots(agg: pd.DataFrame, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_metric(agg, "mean_prr_awareness", out_dir, "Mean PRR")
+    plot_metric(agg, "beacon_error_rate", out_dir, "Beacon error rate")
     plot_metric(agg, "mean_pir_s", out_dir, "Mean PIR (s)")
     plot_metric(agg, "mean_cbr", out_dir, "Mean CBR")
     plot_metric(agg, "cbr_gt_0p6_rate", out_dir, "CBR > 0.6 rate")
     plot_metric(agg, "p95_delay_s", out_dir, "P95 delay (s)")
 
 
+def write_density_bin_outputs(density_metrics: pd.DataFrame, tables_dir: Path) -> None:
+    if density_metrics.empty:
+        return
+    density_metrics.to_csv(tables_dir.parent / "density_bin_metrics.csv", index=False)
+    density_metrics.to_csv(tables_dir / "density_bin_metrics.csv", index=False)
+    summary = (
+        density_metrics.groupby(["method", "density_bin"], as_index=False)
+        .agg(
+            runs=("run", "nunique"),
+            active_vehicle_count_mean=("active_vehicle_count_mean", "mean"),
+            mean_prr_awareness=("mean_prr_awareness", "mean"),
+            beacon_error_rate=("beacon_error_rate", "mean"),
+            mean_pir_s=("mean_pir_s", "mean"),
+            mean_cbr=("mean_cbr", "mean"),
+            cbr_gt_0p6_rate=("cbr_gt_0p6_rate", "mean"),
+        )
+    )
+    summary.to_csv(tables_dir.parent / "density_bin_summary.csv", index=False)
+    summary.to_csv(tables_dir / "density_bin_summary.csv", index=False)
+
+
 def main() -> None:
     args = parse_args()
     run_rows = []
+    density_rows = []
     for method in args.methods:
         method_dir = args.campaign_dir / "02_runs" / method
         if not method_dir.exists():
@@ -201,6 +283,7 @@ def main() -> None:
             row = compute_run_metrics(method, run_dir)
             if row is not None:
                 run_rows.append(row)
+            density_rows.extend(compute_density_bin_metrics(method, run_dir))
 
     if not run_rows:
         raise FileNotFoundError(f"No completed run KPI files found in {args.campaign_dir}")
@@ -211,11 +294,13 @@ def main() -> None:
 
     run_metrics = pd.DataFrame(run_rows).sort_values(["method", "run"])
     agg = aggregate(run_metrics)
+    density_metrics = pd.DataFrame(density_rows)
 
     run_metrics.to_csv(analysis_dir / "run_metrics.csv", index=False)
     agg.to_csv(analysis_dir / "aggregate_metrics.csv", index=False)
     run_metrics.to_csv(tables_dir / "run_metrics.csv", index=False)
     agg.to_csv(tables_dir / "aggregate_metrics.csv", index=False)
+    write_density_bin_outputs(density_metrics, tables_dir)
     write_plots(agg, analysis_dir / "plots")
 
     print(f"Saved run metrics: {analysis_dir / 'run_metrics.csv'}")

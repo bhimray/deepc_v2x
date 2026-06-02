@@ -79,6 +79,10 @@ def run_label(kpi_csv: Path, campaign_dir: Path | None) -> str:
     return kpi_csv.stem
 
 
+def run_method(label: str) -> str:
+    return label.split("/", 1)[0]
+
+
 def metadata_path(kpi_csv: Path) -> Path:
     return Path(f"{kpi_csv.with_suffix('')}_metadata.json")
 
@@ -183,6 +187,100 @@ def plot_time_series(
     save_current(out_path)
 
 
+def plot_time_series_with_active_count(
+    df: pd.DataFrame,
+    y_col: str,
+    ylabel: str,
+    title: str,
+    out_path: Path,
+    ylim: tuple[float, float] | None = None,
+) -> None:
+    fig, ax1 = plt.subplots()
+    ax2 = ax1.twinx()
+    for run, group in df.groupby("run"):
+        ax1.plot(group["time_s"], group[y_col], label=run)
+        ax2.plot(
+            group["time_s"],
+            group["active_vehicle_count_core"],
+            linestyle=":",
+            alpha=0.45,
+            label=f"{run} active vehicles",
+        )
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel(ylabel)
+    ax2.set_ylabel("Active core vehicles")
+    ax1.set_title(title)
+    if ylim is not None:
+        ax1.set_ylim(*ylim)
+    if df["run"].nunique() <= 4:
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize="small")
+    ax1.grid(True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved {out_path}")
+
+
+def add_density_bins(kpi: pd.DataFrame) -> pd.DataFrame:
+    kpi = kpi.copy()
+    if kpi["active_vehicle_count_core"].nunique() >= 3:
+        kpi["density_bin"] = pd.qcut(
+            kpi["active_vehicle_count_core"],
+            q=3,
+            labels=["low", "medium", "high"],
+            duplicates="drop",
+        )
+    else:
+        kpi["density_bin"] = "all"
+    return kpi
+
+
+def write_density_bin_summary(kpi: pd.DataFrame, out_path: Path) -> None:
+    summary = (
+        kpi.groupby(["method", "density_bin"], observed=True)
+        .agg(
+            rows=("time_s", "size"),
+            active_vehicle_count_min=("active_vehicle_count_core", "min"),
+            active_vehicle_count_mean=("active_vehicle_count_core", "mean"),
+            active_vehicle_count_max=("active_vehicle_count_core", "max"),
+            mean_prr_awareness=("prr_awareness", "mean"),
+            beacon_error_rate=("beacon_error_rate", "mean"),
+            mean_pir_s=("pir_s", "mean"),
+            mean_cbr=("cbr", "mean"),
+            cbr_gt_0p6_rate=("cbr_gt_0p6", "mean"),
+        )
+        .reset_index()
+    )
+    summary.to_csv(out_path, index=False)
+    print(f"Saved {out_path}")
+
+
+def plot_density_bin_metric(
+    kpi: pd.DataFrame,
+    y_col: str,
+    ylabel: str,
+    title: str,
+    out_path: Path,
+) -> None:
+    summary = (
+        kpi.groupby(["method", "density_bin"], observed=True)[y_col]
+        .mean()
+        .reset_index()
+    )
+    if summary.empty:
+        return
+    pivot = summary.pivot(index="density_bin", columns="method", values=y_col)
+    pivot.plot(kind="bar", figsize=(8, 4.5))
+    plt.xlabel("Observed density bin")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.xticks(rotation=0)
+    plt.grid(True, axis="y", alpha=0.3)
+    save_current(out_path)
+
+
 def load_kpi_frames(args: argparse.Namespace) -> list[pd.DataFrame]:
     kpi_paths = args.kpi_csv or default_kpi_csvs(args.campaign_dir)
     if not kpi_paths:
@@ -201,7 +299,9 @@ def load_kpi_frames(args: argparse.Namespace) -> list[pd.DataFrame]:
             df = df[df["time_s"] <= end_s].copy()
         if df.empty:
             continue
-        df["run"] = run_label(path, args.campaign_dir)
+        label = run_label(path, args.campaign_dir)
+        df["run"] = label
+        df["method"] = run_method(label)
         frames.append(df)
     return frames
 
@@ -234,6 +334,9 @@ def main() -> None:
     kpi["pir_to_tb_ratio"] = kpi["pir_s"] / kpi["beacon_interval_s"].where(
         kpi["beacon_interval_s"] > 0
     )
+    kpi["beacon_error_rate"] = 1.0 - kpi["prr_awareness"]
+    kpi["cbr_gt_0p6"] = kpi["cbr"] > 0.6
+    kpi = add_density_bins(kpi)
 
     scatter_with_trend(kpi, "beacon_interval_s", "cbr", "Beacon interval Tb (s)", "CBR", "CBR vs Tb", plots_dir / "cbr_vs_tb.png")
     scatter_with_trend(kpi, "beacon_interval_s", "pir_s", "Beacon interval Tb (s)", "Mean PIR (s)", "Mean PIR vs Tb", plots_dir / "pir_vs_tb.png")
@@ -244,8 +347,15 @@ def main() -> None:
     scatter_with_trend(kpi, "active_vehicle_count_core", "cbr", "Active core vehicles", "CBR", "CBR vs active vehicles", plots_dir / "cbr_vs_active_vehicles.png")
     scatter_with_trend(kpi, "active_vehicle_count_core", "prr_awareness", "Active core vehicles", "PRR within awareness range", "PRR vs active vehicles", plots_dir / "prr_vs_active_vehicles.png")
 
-    plot_time_series(kpi, "cbr", "CBR", "CBR time-series sanity", plots_dir / "cbr_timeseries_sanity.png", ylim=(-0.02, 1.02))
-    plot_time_series(kpi, "pir_s", "Mean PIR (s)", "Mean PIR time-series sanity", plots_dir / "pir_timeseries_sanity.png")
+    plot_time_series_with_active_count(kpi, "cbr", "CBR", "CBR and active vehicles over time", plots_dir / "cbr_timeseries_active_vehicles.png", ylim=(-0.02, 1.02))
+    plot_time_series_with_active_count(kpi, "prr_awareness", "PRR within awareness range", "PRR and active vehicles over time", plots_dir / "prr_timeseries_active_vehicles.png", ylim=(-0.02, 1.02))
+    plot_time_series_with_active_count(kpi, "pir_s", "Mean PIR (s)", "PIR and active vehicles over time", plots_dir / "pir_timeseries_active_vehicles.png")
+
+    write_density_bin_summary(kpi, plots_dir / "density_bin_summary.csv")
+    plot_density_bin_metric(kpi, "cbr", "Mean CBR", "CBR by observed density bin", plots_dir / "density_bin_cbr.png")
+    plot_density_bin_metric(kpi, "prr_awareness", "Mean PRR", "PRR by observed density bin", plots_dir / "density_bin_prr.png")
+    plot_density_bin_metric(kpi, "pir_s", "Mean PIR (s)", "PIR by observed density bin", plots_dir / "density_bin_pir.png")
+    plot_density_bin_metric(kpi, "beacon_error_rate", "Beacon error rate", "Beacon error by observed density bin", plots_dir / "density_bin_beacon_error.png")
 
     plt.figure()
     for run, group in kpi.groupby("run"):

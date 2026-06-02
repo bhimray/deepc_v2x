@@ -1373,7 +1373,10 @@ class CamApplication : public Application
     {
         StopCamIfRunning();
         m_assignedVehicleId = kInvalidVehicleId;
-        m_vdp.reset();
+        if (m_running)
+        {
+            ConfigureVehicleServiceState();
+        }
     }
 
     uint32_t GetAssignedVehicleId() const
@@ -1407,7 +1410,6 @@ class CamApplication : public Application
 
         m_caService.setBTP(m_btp);
         ConfigureVehicleServiceState();
-        m_caService.setStationProperties(m_node->GetId(), StationType_passengerCar);
         m_caService.setRealTime(false);
         m_caService.setSocketTx(m_socket);
         m_caService.setSocketRx(m_socket);
@@ -1508,7 +1510,10 @@ class CamApplication : public Application
             return;
         }
 
-        m_vdp = std::make_unique<NgsimVehicleDataProvider>(m_node);
+        if (!m_vdp)
+        {
+            m_vdp = std::make_unique<NgsimVehicleDataProvider>(m_node);
+        }
         m_caService.setVDP(m_vdp.get());
         m_btp->setVDP(m_vdp.get());
 
@@ -1941,7 +1946,7 @@ main(int argc, char* argv[])
     uint32_t maxCamSizeBytes = 300;
     uint16_t port = 8000;
     bool useInputSchedule = true;
-    bool etsiCamGeneration = true;
+    bool etsiCamGeneration = false;
     double fixedBeaconIntervalS = 0.1;
 
     // SL bearer activation
@@ -1953,7 +1958,7 @@ main(int argc, char* argv[])
     // NR-V2X radio baseline
     double centralFrequencyBandSl = 5.9e9;
     uint16_t bandwidthBandSl = 100; // 10 MHz in units of 100 kHz
-    double txPower = 20.0;
+    double txPower = 13.01;
     std::string tddPattern = "DL|DL|DL|F|UL|UL|UL|UL|UL|UL|";
     std::string slBitMap = "1|1|1|1|1|1|0|0|0|1|1|1";
     uint16_t numerologyBwpSl = 0;

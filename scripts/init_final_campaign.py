@@ -12,7 +12,7 @@ from pathlib import Path
 
 DEFAULT_CAMPAIGN_DIR = Path("data/output/final/ieee_250veh_deepc_campaign_01")
 DEFAULT_MOBILITY_CSV = Path("data/processed/ngsim_us101_mainline_active20_250_densest_600s.csv")
-METHODS = ["prbs_open_loop", "fixed_baseline", "threshold_dcc", "deepc_matlab"]
+METHODS = ["prbs_open_loop", "fixed_10hz", "fixed_5hz", "threshold_dcc", "deepc_matlab"]
 RUNS = [101, 102, 103, 104, 105]
 
 
@@ -70,7 +70,8 @@ def run_dir(campaign_dir: Path, method: str, run: int) -> Path:
 def run_manifest(args: argparse.Namespace, method: str, run: int) -> dict:
     controller_type = {
         "prbs_open_loop": "none",
-        "fixed_baseline": "open_loop_fixed_inputs",
+        "fixed_10hz": "open_loop_fixed_10hz",
+        "fixed_5hz": "open_loop_fixed_5hz",
         "threshold_dcc": "threshold_file_bridge",
         "deepc_matlab": "matlab_yalmip_file_bridge",
     }[method]
@@ -144,6 +145,7 @@ def campaign_manifest(args: argparse.Namespace) -> dict:
             "mean_pir_s": "Mean packet inter-reception time over the evaluation window.",
             "mean_cbr": "Mean PHY channel busy ratio over the evaluation window.",
             "cbr_gt_0p6_rate": "Fraction of KPI samples with CBR greater than 0.6.",
+            "beacon_error_rate": "Mean of 1 - PRR over the evaluation window.",
             "p95_delay_s": "95th percentile packet delay from RX packet logs when available.",
         },
         "cleanup": {
@@ -192,7 +194,7 @@ except source code, raw NGSIM input data, and documented environment dependencie
 
 def acceptance_checklist() -> str:
     checks = [
-        "[ ] All 20 final runs completed: 4 methods x 5 runs.",
+        "[ ] All 25 final runs completed: 5 methods x 5 runs.",
         "[ ] Every run has KPI, CBR, metadata, TX log, RX log, and run manifest.",
         "[ ] `scripts/data_validation.py` passed for every run.",
         "[ ] Controller-based runs have bridge logs and success rate >= 95%.",
@@ -237,14 +239,14 @@ MOBILITY_CSV="${{MOBILITY_CSV:-{mobility_csv}}}"
 SIM_TIME="${{SIM_TIME:-30}}"
 MAX_VEHICLES="${{MAX_VEHICLES:-{max_vehicles_arg}}}"
 RUN="${{RUN:-901}}"
-TX_POWER_DBM="${{TX_POWER_DBM:-20}}"
+TX_POWER_DBM="${{TX_POWER_DBM:-13.01}}"
 BEACON_INTERVAL_S="${{BEACON_INTERVAL_S:-0.1}}"
 WARMUP="${{WARMUP:-2}}"
 COOLDOWN="${{COOLDOWN:-2}}"
 OUT="{cd}/tmp/fixed_baseline_open_loop_smoke"
 mkdir -p "$OUT/validation" "$OUT/plots"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=$SIM_TIME --warmup=$WARMUP --cooldown=$COOLDOWN --maxVehicles=$MAX_VEHICLES --seed=12345 --run=$RUN --useInputSchedule=false --txPower=$TX_POWER_DBM --fixedBeaconInterval=$BEACON_INTERVAL_S --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/ns3.log"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=$SIM_TIME --warmup=$WARMUP --cooldown=$COOLDOWN --maxVehicles=$MAX_VEHICLES --seed=12345 --run=$RUN --useInputSchedule=false --txPower=$TX_POWER_DBM --fixedBeaconInterval=$BEACON_INTERVAL_S --etsiCamGeneration=false --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 "$PYTHON" scripts/plot_deepc_bridge_run.py "$OUT" --out-dir "$OUT/plots"
 """,
@@ -277,7 +279,7 @@ mkdir -p "$OUT/logs" "$OUT/validation" "$OUT/plots"
 ./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 """,
-        "run_fixed_baseline.sh": f"""#!/usr/bin/env bash
+        "run_fixed_10hz.sh": f"""#!/usr/bin/env bash
 set -euo pipefail
 
 PYTHON="${{PYTHON:-./v2x_env/bin/python}}"
@@ -285,10 +287,25 @@ export MPLCONFIGDIR="${{MPLCONFIGDIR:-/tmp/matplotlib}}"
 export CCACHE_DISABLE="${{CCACHE_DISABLE:-1}}"
 MOBILITY_CSV="${{MOBILITY_CSV:-{mobility_csv}}}"
 RUN="${{1:?Usage: $0 RUN_NUMBER}}"
-OUT="{cd}/02_runs/fixed_baseline/run_$RUN"
+OUT="{cd}/02_runs/fixed_10hz/run_$RUN"
 mkdir -p "$OUT/logs" "$OUT/validation" "$OUT/plots"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=20 --fixedBeaconInterval=0.1 --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=13.01 --fixedBeaconInterval=0.1 --etsiCamGeneration=false --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
+"$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
+"$PYTHON" scripts/plot_deepc_bridge_run.py "$OUT"
+""",
+        "run_fixed_5hz.sh": f"""#!/usr/bin/env bash
+set -euo pipefail
+
+PYTHON="${{PYTHON:-./v2x_env/bin/python}}"
+export MPLCONFIGDIR="${{MPLCONFIGDIR:-/tmp/matplotlib}}"
+export CCACHE_DISABLE="${{CCACHE_DISABLE:-1}}"
+MOBILITY_CSV="${{MOBILITY_CSV:-{mobility_csv}}}"
+RUN="${{1:?Usage: $0 RUN_NUMBER}}"
+OUT="{cd}/02_runs/fixed_5hz/run_$RUN"
+mkdir -p "$OUT/logs" "$OUT/validation" "$OUT/plots"
+
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=13.01 --fixedBeaconInterval=0.2 --etsiCamGeneration=false --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 "$PYTHON" scripts/plot_deepc_bridge_run.py "$OUT"
 """,
