@@ -23,8 +23,13 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
+
+
+TRAFFIC_CONTEXT_COLUMNS = [
+    ("density_veh_per_km_core", "Density veh/km", "mean_density_veh_per_km_core"),
+    ("active_vehicle_count_core", "Active core vehicles", "mean_active_vehicle_count_core"),
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +73,19 @@ def add_prr_alias(kpi: pd.DataFrame) -> pd.DataFrame:
     return kpi
 
 
+def require_columns(df: pd.DataFrame, path: Path, columns: list[str]) -> None:
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {', '.join(missing)}")
+
+
+def traffic_context_column(kpi: pd.DataFrame) -> tuple[str, str, str] | None:
+    for column, ylabel, metric_name in TRAFFIC_CONTEXT_COLUMNS:
+        if column in kpi:
+            return column, ylabel, metric_name
+    return None
+
+
 def metrics(kpi: pd.DataFrame, applied: pd.DataFrame | None, timing: pd.DataFrame | None) -> dict:
     result = {
         "rows": int(len(kpi)),
@@ -76,8 +94,10 @@ def metrics(kpi: pd.DataFrame, applied: pd.DataFrame | None, timing: pd.DataFram
         "mean_pir_s": float(kpi["pir_s"].mean()),
         "mean_cbr": float(kpi["cbr"].mean()),
         "cbr_gt_0p6_rate": float((kpi["cbr"] > 0.6).mean()),
-        "mean_density_veh_per_km_core": float(kpi["density_veh_per_km_core"].mean()),
     }
+    for column, _ylabel, metric_name in TRAFFIC_CONTEXT_COLUMNS:
+        if column in kpi:
+            result[metric_name] = float(kpi[column].mean())
     if applied is not None and len(applied):
         result.update(
             {
@@ -100,7 +120,9 @@ def metrics(kpi: pd.DataFrame, applied: pd.DataFrame | None, timing: pd.DataFram
 
 
 def plot_kpis(kpi: pd.DataFrame, out_dir: Path) -> None:
-    fig, axes = plt.subplots(4, 1, figsize=(11, 9), sharex=True)
+    traffic_context = traffic_context_column(kpi)
+    row_count = 4 if traffic_context is not None else 3
+    fig, axes = plt.subplots(row_count, 1, figsize=(11, 9 if traffic_context else 7), sharex=True)
     axes[0].plot(kpi["time_s"], kpi["prr_awareness"], color="tab:green")
     axes[0].set_ylabel("PRR awareness")
     axes[0].set_ylim(-0.03, 1.03)
@@ -115,10 +137,13 @@ def plot_kpis(kpi: pd.DataFrame, out_dir: Path) -> None:
     axes[2].set_ylabel("PIR (s)")
     axes[2].grid(alpha=0.3)
 
-    axes[3].plot(kpi["time_s"], kpi["density_veh_per_km_core"], color="tab:purple")
-    axes[3].set_ylabel("Density veh/km")
-    axes[3].set_xlabel("Time (s)")
-    axes[3].grid(alpha=0.3)
+    if traffic_context is not None:
+        column, ylabel, _metric_name = traffic_context
+        axes[3].plot(kpi["time_s"], kpi[column], color="tab:purple")
+        axes[3].set_ylabel(ylabel)
+        axes[3].grid(alpha=0.3)
+
+    axes[-1].set_xlabel("Time (s)")
 
     fig.tight_layout()
     fig.savefig(out_dir / "kpi_timeseries.png", dpi=180)
@@ -187,6 +212,11 @@ def main() -> None:
     if not kpi_path.exists():
         raise FileNotFoundError(f"Missing KPI file: {kpi_path}")
     kpi = add_prr_alias(pd.read_csv(kpi_path))
+    require_columns(
+        kpi,
+        kpi_path,
+        ["time_s", "tx_power_dbm", "beacon_interval_s", "prr_awareness", "pir_s", "cbr"],
+    )
     applied = load_optional_csv([run_dir / "applied_controls.csv", run_dir / "bridge" / "applied_controls.csv"])
     timing = load_optional_csv(
         [run_dir / "controller_solve_times.csv", run_dir / "bridge" / "controller_solve_times.csv"]

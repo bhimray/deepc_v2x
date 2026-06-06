@@ -803,7 +803,10 @@ class KpiLogger : public Object
             NS_FATAL_ERROR("Cannot open KPI output CSV: " << csvPath);
         }
         m_out << "time_s,tx_power_dbm,beacon_interval_s,"
-              << "active_vehicle_count_core,prr_awareness,pir_s,cbr\n";
+                << "active_vehicle_count_core,"
+                << "tx_count,eligible_count,success_count,"
+                << "mean_eligible_per_tx,mean_success_per_tx,"
+                << "prr_awareness,pir_s,pir_count,cbr\n";
     }
 
     void RegisterNodeIpv4(uint32_t nodeId, const Ipv4Address& addr)
@@ -985,13 +988,31 @@ class KpiLogger : public Object
         const uint32_t activeVehicleCount = CountActiveCoreVehicles(now);
         MaybePrintProgress(now, activeVehicleCount);
 
+        const uint64_t txCount = m_txEvents.size();
+
+        const double meanEligiblePerTx =
+            (txCount > 0)
+                ? static_cast<double>(denom) / static_cast<double>(txCount)
+                : 0.0;
+
+        const double meanSuccessPerTx =
+            (txCount > 0)
+                ? static_cast<double>(numer) / static_cast<double>(txCount)
+                : 0.0;
+
         m_out << std::fixed << std::setprecision(6) << now << ","
-              << m_currentP << ","
-              << m_currentTb << ","
-              << activeVehicleCount << ","
-              << prr << ","
-              << pirMean << ","
-              << cbr << "\n";
+                << m_currentP << ","
+                << m_currentTb << ","
+                << activeVehicleCount << ","
+                << txCount << ","
+                << denom << ","
+                << numer << ","
+                << meanEligiblePerTx << ","
+                << meanSuccessPerTx << ","
+                << prr << ","
+                << pirMean << ","
+                << pirCount << ","
+                << cbr << "\n";
 
         Simulator::Schedule(Seconds(m_sampleTimeS), &KpiLogger::SampleAndWrite, this);
     }
@@ -1918,7 +1939,8 @@ WriteMetadataJson(const std::string& kpiCsv,
         << sampleTimeS << " s timestamps; no interpolation is applied\",\n"
         << "  \"deepc_dataset_columns\": "
            "\"time_s,tx_power_dbm,beacon_interval_s,active_vehicle_count_core,"
-           "prr_awareness,pir_s,cbr\"\n"
+           "tx_count,eligible_count,success_count,mean_eligible_per_tx,"
+           "mean_success_per_tx,prr_awareness,pir_s,pir_count,cbr\"\n"
         << "}\n";
 }
 
@@ -1952,31 +1974,31 @@ main(int argc, char* argv[])
     // SL bearer activation
     Time slBearersActivationTime = Seconds(2.0);
     Time camApplicationStartDelay = MilliSeconds(200);
-    bool harqEnabled = true;
+    bool harqEnabled = false;
     Time delayBudget = Seconds(0);
 
     // NR-V2X radio baseline
     double centralFrequencyBandSl = 5.9e9;
     uint16_t bandwidthBandSl = 100; // 10 MHz in units of 100 kHz
-    double txPower = 13.01;
+    double txPower = 20.0;
     std::string tddPattern = "DL|DL|DL|F|UL|UL|UL|UL|UL|UL|";
     std::string slBitMap = "1|1|1|1|1|1|0|0|0|1|1|1";
     uint16_t numerologyBwpSl = 0;
     uint16_t slSensingWindow = 100;
-    uint16_t slSelectionWindow = 5;
-    uint16_t slSubchannelSize = 50;
+    uint16_t slSelectionWindow = 20; // 5 default
+    uint16_t slSubchannelSize = 20; //50 default
     uint16_t slMaxNumPerReserve = 3;
     double slProbResourceKeep = 0.0;
     uint16_t slMaxTxTransNumPssch = 5;
     uint16_t reservationPeriod = 100;
-    bool enableSensing = false;
+    bool enableSensing = true;
     uint16_t t1 = 2;
     uint16_t t2 = 33;
     int slThresPsschRsrp = -128;
     bool enableChannelRandomness = true;
     uint16_t channelUpdatePeriod = 500;
     uint16_t mcs = 6;
-    double awarenessRangeM = 300.0;
+    double awarenessRangeM = 200.0;
     double kpiWindowS = 1.0;
     double sampleTimeS = 0.5;
     bool dynamicActivePool = true;
@@ -2008,6 +2030,15 @@ main(int argc, char* argv[])
     cmd.AddValue("mcs", "Fixed sidelink MCS", mcs);
     cmd.AddValue("txPower", "Baseline Tx power [dBm]", txPower);
     cmd.AddValue("enableSensing", "Enable NR sidelink sensing-based resource selection", enableSensing);
+    cmd.AddValue("slSubchannelSize", "Sidelink subchannel size [RBs]", slSubchannelSize);
+    cmd.AddValue("slSelectionWindow", "Sidelink selection window [slots]; allowed values: 1, 5, 10, 20", slSelectionWindow);
+    cmd.AddValue("slProbResourceKeep", "Sidelink probability of keeping a selected resource", slProbResourceKeep);
+    cmd.AddValue("harqEnabled", "Enable sidelink HARQ", harqEnabled);
+    cmd.AddValue("slMaxTxTransNumPssch", "Maximum number of PSSCH transmissions", slMaxTxTransNumPssch);
+    cmd.AddValue("reservationPeriod", "Sidelink reservation period [ms]", reservationPeriod);
+    cmd.AddValue("t1", "Sidelink sensing T1 [slots]", t1);
+    cmd.AddValue("t2", "Sidelink sensing T2 [slots]", t2);
+    cmd.AddValue("slThresPsschRsrp", "Sidelink PSSCH RSRP threshold [dBm]", slThresPsschRsrp);
     cmd.AddValue("enableChannelRandomness", "Enable channel update randomness", enableChannelRandomness);
     cmd.AddValue("awarenessRange", "PRR awareness range [m]", awarenessRangeM);
     cmd.AddValue("kpiWindow", "KPI sliding window [s]", kpiWindowS);

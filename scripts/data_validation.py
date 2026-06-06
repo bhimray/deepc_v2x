@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
         default=KPI_WINDOW_S,
         help=f"PRR validation window in seconds. Default: {KPI_WINDOW_S}",
     )
+    parser.add_argument(
+        "--require-packet-logs",
+        action="store_true",
+        help="Fail when TX/RX packet log sidecars are missing instead of running KPI-only checks.",
+    )
     return parser.parse_args()
 
 
@@ -133,6 +138,57 @@ def require_columns(df: pd.DataFrame, path: Path, columns: list[str]) -> None:
         raise ValueError(f"{path} is missing required columns: {', '.join(missing)}")
 
 
+def print_optional_mean(df: pd.DataFrame, column: str, label: str) -> None:
+    if column in df:
+        print(f"{label}: {df[column].mean():.6f}")
+
+
+def plot_kpi_timeseries(kpi_eval: pd.DataFrame, args: argparse.Namespace) -> None:
+    for column, ylabel, filename in [
+        ("prr_awareness", "PRR", "kpi_prr_timeseries.png"),
+        ("pir_s", "PIR (s)", "kpi_pir_timeseries.png"),
+        ("cbr", "CBR", "kpi_cbr_timeseries.png"),
+        ("active_vehicle_count_core", "Active core vehicles", "kpi_active_vehicles_timeseries.png"),
+    ]:
+        if column not in kpi_eval:
+            continue
+        plt.figure()
+        plt.plot(kpi_eval["time_s"], kpi_eval[column])
+        plt.xlabel("Time (s)")
+        plt.ylabel(ylabel)
+        plt.title(f"{ylabel} over time")
+        plt.grid()
+        save_or_show(
+            args.out_dir / filename if args.out_dir is not None else None,
+            args.show,
+        )
+
+
+def kpi_only_validation(
+    kpi_eval: pd.DataFrame,
+    kpi_path: Path,
+    warmup: float,
+    eval_end: float | None,
+    args: argparse.Namespace,
+) -> None:
+    print("\n===== KPI-ONLY VALIDATION =====")
+    print(f"KPI CSV             : {kpi_path}")
+    print("TX/RX packet logs   : not found; skipped raw-log PRR validation")
+    print(f"Evaluation window   : {warmup:.1f} s to {eval_end if eval_end is not None else 'end'}")
+    print(f"Rows                : {len(kpi_eval)}")
+    print(f"Mean PRR KPI samples: {kpi_eval['prr_awareness'].mean():.6f}")
+    print(f"Beacon error rate   : {(1.0 - kpi_eval['prr_awareness']).mean():.6f}")
+    print(f"Mean PIR from KPI   : {kpi_eval['pir_s'].mean():.6f}")
+    print(f"Mean Tb             : {kpi_eval['beacon_interval_s'].mean():.6f}")
+    print_optional_mean(kpi_eval, "active_vehicle_count_core", "Mean active vehicles")
+    print_optional_mean(kpi_eval, "density_veh_per_km_core", "Mean density veh/km ")
+    print_optional_mean(kpi_eval, "mean_neighbors_150m", "Mean neighbors 150m ")
+    print_optional_mean(kpi_eval, "mean_neighbors_300m", "Mean neighbors 300m ")
+    print(f"Mean PHY CBR        : {kpi_eval['cbr'].mean():.6f}")
+    print_optional_mean(kpi_eval, "sensing_exclusion_ratio", "Mean sensing exclusion ratio")
+    plot_kpi_timeseries(kpi_eval, args)
+
+
 def eligible_bin_columns(tx: pd.DataFrame) -> list[tuple[str, float, float]]:
     pattern = re.compile(r"^eligible_(\d+)_(\d+)m$")
     cols: list[tuple[str, float, float]] = []
@@ -171,14 +227,10 @@ def main() -> None:
     tx_path, rx_path = log_paths(kpi_path)
     metadata = load_metadata(kpi_path)
 
-    for path in (kpi_path, tx_path, rx_path):
-        if not path.exists():
-            raise FileNotFoundError(path)
+    if not kpi_path.exists():
+        raise FileNotFoundError(kpi_path)
 
     kpi = add_prr_alias(pd.read_csv(kpi_path))
-    tx = add_eligible_alias(pd.read_csv(tx_path))
-    rx = pd.read_csv(rx_path)
-
     require_columns(
         kpi,
         kpi_path,
@@ -188,18 +240,8 @@ def main() -> None:
             "pir_s",
             "beacon_interval_s",
             "active_vehicle_count_core",
-            "density_veh_per_km_core",
-            "mean_neighbors_150m",
-            "mean_neighbors_300m",
             "cbr",
-            "sensing_exclusion_ratio",
         ],
-    )
-    require_columns(tx, tx_path, ["time_s", "eligible_rx_count_awareness"])
-    require_columns(
-        rx,
-        rx_path,
-        ["time_s", "tx_node_id", "rx_node_id", "seq", "distance_m", "pir_s"],
     )
 
     warmup = args.warmup
@@ -221,15 +263,30 @@ def main() -> None:
         awareness_range = float(metadata.get("awareness_range_m", AWARENESS_RANGE_M))
 
     kpi_eval = filter_eval_window(kpi, warmup, eval_end)
-    tx_eval = filter_eval_window(tx, warmup, eval_end)
-    rx_eval = filter_eval_window(rx, warmup, eval_end)
-
     if kpi_eval.empty:
         last_time = kpi["time_s"].max() if not kpi.empty else float("nan")
         raise ValueError(
             f"No KPI samples remain in evaluation window starting at {warmup:.1f} s "
             f"for {kpi_path}. Last KPI sample time is {last_time:.6g} s."
         )
+
+    missing_logs = [path for path in (tx_path, rx_path) if not path.exists()]
+    if missing_logs:
+        if args.require_packet_logs:
+            raise FileNotFoundError(missing_logs[0])
+        kpi_only_validation(kpi_eval, kpi_path, warmup, eval_end, args)
+        return
+
+    tx = add_eligible_alias(pd.read_csv(tx_path))
+    rx = pd.read_csv(rx_path)
+    require_columns(tx, tx_path, ["time_s", "eligible_rx_count_awareness"])
+    require_columns(
+        rx,
+        rx_path,
+        ["time_s", "tx_node_id", "rx_node_id", "seq", "distance_m", "pir_s"],
+    )
+    tx_eval = filter_eval_window(tx, warmup, eval_end)
+    rx_eval = filter_eval_window(rx, warmup, eval_end)
 
     # =========================
     # 1. GLOBAL PRR VALIDATION
@@ -299,15 +356,12 @@ def main() -> None:
     print(f"Mean PIR from RX log : {pir_valid.mean():.6f}")
     print(f"Mean PIR from KPI    : {kpi_eval['pir_s'].mean():.6f}")
     print(f"Mean Tb             : {kpi_eval['beacon_interval_s'].mean():.6f}")
-    print(f"Mean active vehicles: {kpi_eval['active_vehicle_count_core'].mean():.6f}")
-    print(f"Mean density veh/km : {kpi_eval['density_veh_per_km_core'].mean():.6f}")
-    print(f"Mean neighbors 150m : {kpi_eval['mean_neighbors_150m'].mean():.6f}")
-    print(f"Mean neighbors 300m : {kpi_eval['mean_neighbors_300m'].mean():.6f}")
+    print_optional_mean(kpi_eval, "active_vehicle_count_core", "Mean active vehicles")
+    print_optional_mean(kpi_eval, "density_veh_per_km_core", "Mean density veh/km ")
+    print_optional_mean(kpi_eval, "mean_neighbors_150m", "Mean neighbors 150m ")
+    print_optional_mean(kpi_eval, "mean_neighbors_300m", "Mean neighbors 300m ")
     print(f"Mean PHY CBR        : {kpi_eval['cbr'].mean():.6f}")
-    print(
-        "Mean sensing exclusion ratio: "
-        f"{kpi_eval['sensing_exclusion_ratio'].mean():.6f}"
-    )
+    print_optional_mean(kpi_eval, "sensing_exclusion_ratio", "Mean sensing exclusion ratio")
 
     plt.figure()
     plt.scatter(kpi_eval["beacon_interval_s"], kpi_eval["pir_s"], alpha=0.5)

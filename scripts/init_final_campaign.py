@@ -138,7 +138,7 @@ def campaign_manifest(args: argparse.Namespace) -> dict:
             "cooldown_s": args.cooldown,
             "sample_time_s": 0.1,
             "control_interval_s": 0.5,
-            "awareness_range_m": 300.0,
+            "awareness_range_m": 200.0,
         },
         "metric_definitions": {
             "mean_prr_awareness": "Mean KPI PRR over the evaluation window.",
@@ -239,14 +239,14 @@ MOBILITY_CSV="${{MOBILITY_CSV:-{mobility_csv}}}"
 SIM_TIME="${{SIM_TIME:-30}}"
 MAX_VEHICLES="${{MAX_VEHICLES:-{max_vehicles_arg}}}"
 RUN="${{RUN:-901}}"
-TX_POWER_DBM="${{TX_POWER_DBM:-13.01}}"
+TX_POWER_DBM="${{TX_POWER_DBM:-20}}"
 BEACON_INTERVAL_S="${{BEACON_INTERVAL_S:-0.1}}"
 WARMUP="${{WARMUP:-2}}"
 COOLDOWN="${{COOLDOWN:-2}}"
 OUT="{cd}/tmp/fixed_baseline_open_loop_smoke"
 mkdir -p "$OUT/validation" "$OUT/plots"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=$SIM_TIME --warmup=$WARMUP --cooldown=$COOLDOWN --maxVehicles=$MAX_VEHICLES --seed=12345 --run=$RUN --useInputSchedule=false --txPower=$TX_POWER_DBM --fixedBeaconInterval=$BEACON_INTERVAL_S --etsiCamGeneration=false --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/ns3.log"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=$SIM_TIME --warmup=$WARMUP --cooldown=$COOLDOWN --maxVehicles=$MAX_VEHICLES --seed=12345 --run=$RUN --useInputSchedule=false --txPower=$TX_POWER_DBM --fixedBeaconInterval=$BEACON_INTERVAL_S --etsiCamGeneration=false --awarenessRange=200 --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 "$PYTHON" scripts/plot_deepc_bridge_run.py "$OUT" --out-dir "$OUT/plots"
 """,
@@ -290,7 +290,7 @@ RUN="${{1:?Usage: $0 RUN_NUMBER}}"
 OUT="{cd}/02_runs/fixed_10hz/run_$RUN"
 mkdir -p "$OUT/logs" "$OUT/validation" "$OUT/plots"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=13.01 --fixedBeaconInterval=0.1 --etsiCamGeneration=false --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=20 --fixedBeaconInterval=0.1 --etsiCamGeneration=false --awarenessRange=200 --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 "$PYTHON" scripts/plot_deepc_bridge_run.py "$OUT"
 """,
@@ -305,7 +305,7 @@ RUN="${{1:?Usage: $0 RUN_NUMBER}}"
 OUT="{cd}/02_runs/fixed_5hz/run_$RUN"
 mkdir -p "$OUT/logs" "$OUT/validation" "$OUT/plots"
 
-./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=13.01 --fixedBeaconInterval=0.2 --etsiCamGeneration=false --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
+./ns3 run "nr_v2x_ngsim_deepc_data_set_generation --mobilityCsv=$MOBILITY_CSV --simTime=300 --maxVehicles={max_vehicles_arg} --seed=12345 --run=$RUN --useInputSchedule=false --txPower=20 --fixedBeaconInterval=0.2 --etsiCamGeneration=false --awarenessRange=200 --kpiCsv=$OUT/kpi_timeseries.csv" | tee "$OUT/logs/ns3.log"
 "$PYTHON" scripts/data_validation.py "$OUT/kpi_timeseries.csv" --out-dir "$OUT/validation" > "$OUT/validation/data_validation.txt"
 "$PYTHON" scripts/plot_deepc_bridge_run.py "$OUT"
 """,
