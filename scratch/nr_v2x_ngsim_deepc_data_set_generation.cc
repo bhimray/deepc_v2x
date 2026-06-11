@@ -1958,7 +1958,7 @@ main(int argc, char* argv[])
     std::string kpiCsv = "data/output/deepc_open_loop_250veh/kpi_timeseries.csv";
 
     // Simulation time
-    double simTimeSeconds = 600.0;
+    double simTimeSeconds = 300.0;
     double warmupS = 10.0;
     double cooldownS = 10.0;
     uint32_t seed = 12345; // 12345, 12346, 12347 for runs 1, 2, 3
