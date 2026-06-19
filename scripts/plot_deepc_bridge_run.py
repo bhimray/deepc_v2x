@@ -62,7 +62,10 @@ def resolve_run_dir(args: argparse.Namespace) -> Path:
 def load_optional_csv(paths: list[Path]) -> pd.DataFrame | None:
     for path in paths:
         if path.exists():
-            return pd.read_csv(path)
+            try:
+                return pd.read_csv(path)
+            except pd.errors.EmptyDataError:
+                continue
     return None
 
 
@@ -86,7 +89,12 @@ def traffic_context_column(kpi: pd.DataFrame) -> tuple[str, str, str] | None:
     return None
 
 
-def metrics(kpi: pd.DataFrame, applied: pd.DataFrame | None, timing: pd.DataFrame | None) -> dict:
+def metrics(
+    kpi: pd.DataFrame,
+    applied: pd.DataFrame | None,
+    timing: pd.DataFrame | None,
+    predictions: pd.DataFrame | None,
+) -> dict:
     result = {
         "rows": int(len(kpi)),
         "time_range_s": [float(kpi["time_s"].min()), float(kpi["time_s"].max())],
@@ -116,6 +124,12 @@ def metrics(kpi: pd.DataFrame, applied: pd.DataFrame | None, timing: pd.DataFram
                 "max_controller_solve_time_s": float(timing["controller_solve_time_s"].max()),
             }
         )
+    if applied is not None and len(applied):
+        for column in ["max_up_residual", "max_yp_residual"]:
+            if column in applied:
+                result[column] = float(applied[column].max())
+    if predictions is not None and len(predictions):
+        result["prediction_rows"] = int(len(predictions))
     return result
 
 
@@ -202,6 +216,95 @@ def plot_controller(timing: pd.DataFrame | None, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def add_measured_predictions(
+    kpi: pd.DataFrame, predictions: pd.DataFrame
+) -> pd.DataFrame:
+    left = predictions.sort_values("predicted_time_s").copy()
+    right = kpi[
+        ["time_s", "prr_awareness", "pir_s", "cbr"]
+    ].sort_values("time_s").rename(
+        columns={
+            "prr_awareness": "measured_prr",
+            "pir_s": "measured_pir_s",
+            "cbr": "measured_cbr",
+        }
+    )
+    return pd.merge_asof(
+        left,
+        right,
+        left_on="predicted_time_s",
+        right_on="time_s",
+        direction="nearest",
+        tolerance=0.05,
+    )
+
+
+def plot_predictions(
+    kpi: pd.DataFrame, predictions: pd.DataFrame | None, out_dir: Path
+) -> None:
+    if predictions is None or not len(predictions):
+        return
+
+    fig, axes = plt.subplots(4, 1, figsize=(11, 10), sharex=True)
+    signals = [
+        ("predicted_tx_power_dbm", "Tx power (dBm)", None),
+        ("predicted_prr", "PRR", ("prr_awareness", "Measured")),
+        ("predicted_pir_s", "PIR (s)", ("pir_s", "Measured")),
+        ("predicted_cbr", "CBR", ("cbr", "Measured")),
+    ]
+    for _step, group in predictions.groupby("step"):
+        for axis, (column, _label, _measured) in zip(axes, signals):
+            axis.plot(
+                group["predicted_time_s"],
+                group[column],
+                color="tab:orange",
+                alpha=0.18,
+                linewidth=0.8,
+            )
+    for axis, (_column, label, measured) in zip(axes, signals):
+        if measured is not None:
+            axis.plot(kpi["time_s"], kpi[measured[0]], color="black", linewidth=1.0, label=measured[1])
+            axis.legend()
+        axis.set_ylabel(label)
+        axis.grid(alpha=0.3)
+    axes[-1].set_xlabel("Time (s)")
+    fig.tight_layout()
+    fig.savefig(out_dir / "prediction_trajectories_10_step.png", dpi=180)
+    plt.close(fig)
+
+    compared = add_measured_predictions(kpi, predictions).dropna(subset=["measured_prr"])
+    if compared.empty:
+        return
+    compared["prr_error"] = compared["predicted_prr"] - compared["measured_prr"]
+    compared["pir_error"] = compared["predicted_pir_s"] - compared["measured_pir_s"]
+    compared["cbr_error"] = compared["predicted_cbr"] - compared["measured_cbr"]
+    rows = []
+    for horizon, group in compared.groupby("horizon_step"):
+        row = {"horizon_step": int(horizon)}
+        for signal in ["prr", "pir", "cbr"]:
+            error = group[f"{signal}_error"]
+            row[f"{signal}_mae"] = float(error.abs().mean())
+            row[f"{signal}_rmse"] = float((error.pow(2).mean()) ** 0.5)
+        rows.append(row)
+    horizon_metrics = pd.DataFrame(rows).sort_values("horizon_step")
+    horizon_metrics.to_csv(out_dir / "prediction_error_by_horizon.csv", index=False)
+
+    fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+    for axis, signal, label in zip(axes, ["prr", "pir", "cbr"], ["PRR", "PIR (s)", "CBR"]):
+        axis.plot(
+            horizon_metrics["horizon_step"],
+            horizon_metrics[f"{signal}_rmse"],
+            marker="o",
+        )
+        axis.set_ylabel(f"{label} RMSE")
+        axis.grid(alpha=0.3)
+    axes[-1].set_xlabel("Prediction horizon step")
+    axes[-1].set_xticks(range(1, 11))
+    fig.tight_layout()
+    fig.savefig(out_dir / "prediction_error_by_horizon.png", dpi=180)
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     run_dir = resolve_run_dir(args)
@@ -221,12 +324,14 @@ def main() -> None:
     timing = load_optional_csv(
         [run_dir / "controller_solve_times.csv", run_dir / "bridge" / "controller_solve_times.csv"]
     )
+    predictions = load_optional_csv([run_dir / "predictions.csv", run_dir / "bridge" / "predictions.csv"])
 
     plot_kpis(kpi, out_dir)
     plot_controls(kpi, applied, out_dir)
     plot_controller(timing, out_dir)
+    plot_predictions(kpi, predictions, out_dir)
 
-    summary = metrics(kpi, applied, timing)
+    summary = metrics(kpi, applied, timing, predictions)
     with (out_dir / "summary_metrics.json").open("w") as f:
         json.dump(summary, f, indent=2)
     print(f"Saved plots to {out_dir}")

@@ -1,11 +1,9 @@
 /* -*-  Mode: C++; c-file-style: "gnu"; indent-tabs-mode:nil; -*- */
 /*
- * Closed-loop MATLAB DeePC NR-V2X experiment driver.
+ * Closed-loop NR-V2X experiment driver for Python/OSQP DeePC.
  *
- * This scratch program is intentionally for closed-loop DeePC only:
- * - MATLAB writes control actions through the file bridge.
- * - PRBS input scheduling is disabled so it cannot overwrite DeePC actions.
- * - Use nr_v2x_ngsim_deepc_data_set_generation for open-loop PRBS data.
+ * The controller changes Tx power only. CAM generation remains fixed at 10 Hz,
+ * and the dynamic physical-UE pool matches the training-data scenario.
  */
 
 #include "ns3/antenna-module.h"
@@ -23,15 +21,17 @@
 #include "ns3/point-to-point-module.h"
 #include "ns3/tag.h"
 #include "ns3/vdp.h"
+
 #include "../src/cbr-logger.cc"
 
 #include <algorithm>
 #include <bitset>
-#include <cmath>
 #include <cctype>
+#include <cmath>
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -41,11 +41,11 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 #include <chrono>
-#include <thread>
 
 using namespace ns3;
 
@@ -73,41 +73,30 @@ struct InputCommand
 struct TxEvent
 {
     double timeS;
-    uint32_t txNodeId;
+    uint32_t txVehicleId;
     uint64_t seq;
-    Vector posTx;
     uint32_t eligibleRxCount;
-    std::vector<uint32_t> eligibleRxCountsByBin;
     std::map<uint32_t, double> rxDistanceAtTxM;
 };
 
 struct RxEvent
 {
     double timeS;
-    uint32_t txNodeId;
-    uint32_t rxNodeId;
+    uint32_t txVehicleId;
+    uint32_t rxVehicleId;
     uint64_t seq;
-    Vector posTx;
-    Vector posRx;
-    double distanceAtTxM;
-    double distanceAtRxM;
     double pirS;
-    double delayS;
 };
 
 struct KpiSample
 {
     double timeS = 0.0;
     double txPowerDbm = 0.0;
-    double beaconIntervalS = 0.0;
+    double beaconIntervalS = 0.1;
     double activeVehicleCountCore = 0.0;
-    double densityVehPerKmCore = 0.0;
-    double meanNeighbors150m = 0.0;
-    double meanNeighbors300m = 0.0;
     double prrAwareness = 0.0;
     double pirS = 0.0;
     double cbr = 0.0;
-    double sensingExclusionRatio = 0.0;
 };
 
 class KpiPacketTag : public Tag
@@ -129,24 +118,27 @@ class KpiPacketTag : public Tag
 
     uint32_t GetSerializedSize() const override
     {
-        return 16;
+        return 20;
     }
 
     void Serialize(TagBuffer i) const override
     {
         i.WriteU64(m_sequence);
         i.WriteU64(static_cast<uint64_t>(m_txTimeNs));
+        i.WriteU32(m_txVehicleId);
     }
 
     void Deserialize(TagBuffer i) override
     {
         m_sequence = i.ReadU64();
         m_txTimeNs = static_cast<int64_t>(i.ReadU64());
+        m_txVehicleId = i.ReadU32();
     }
 
     void Print(std::ostream& os) const override
     {
-        os << "sequence=" << m_sequence << ",txTimeNs=" << m_txTimeNs;
+        os << "sequence=" << m_sequence << ",txTimeNs=" << m_txTimeNs
+           << ",txVehicleId=" << m_txVehicleId;
     }
 
     void SetSequence(uint64_t sequence)
@@ -169,10 +161,25 @@ class KpiPacketTag : public Tag
         return m_txTimeNs;
     }
 
+    void SetTxVehicleId(uint32_t vehicleId)
+    {
+        m_txVehicleId = vehicleId;
+    }
+
+    uint32_t GetTxVehicleId() const
+    {
+        return m_txVehicleId;
+    }
+
   private:
     uint64_t m_sequence = 0;
     int64_t m_txTimeNs = 0;
+    uint32_t m_txVehicleId = std::numeric_limits<uint32_t>::max();
 };
+
+static constexpr uint32_t kInvalidVehicleId = std::numeric_limits<uint32_t>::max();
+static constexpr uint32_t kMaxPhysicalUePoolSize = 250;
+static constexpr double kAssignmentEpsS = 1e-6;
 
 static std::map<uint32_t, std::vector<MobilityRow>> g_mobilityByVehicle;
 static std::vector<InputCommand> g_inputSchedule;
@@ -181,6 +188,10 @@ static std::map<uint32_t, uint32_t> g_vehicleIdToNodeId;
 static std::map<uint32_t, uint32_t> g_nodeIdToVehicleId;
 static std::map<uint32_t, Ptr<Node>> g_nodeIdToNode;
 static std::map<uint32_t, std::pair<double, double>> g_nodeIdToActiveTimeRangeS;
+static std::map<uint32_t, Ptr<class NgsimPoolMobilityModel>> g_nodeIdToPoolMobility;
+static std::deque<uint32_t> g_freePoolNodeIds;
+static std::set<uint32_t> g_activeVehicleIds;
+static bool g_dynamicActivePoolEnabled = false;
 
 /****************************************************************
  * Helpers
@@ -229,9 +240,41 @@ IsInsideCoreRegion(double coordinate, double coreMin, double coreMax)
     return coordinate >= coreMin && coordinate <= coreMax;
 }
 
+static Vector
+GetInactiveParkingPosition(uint32_t nodeId)
+{
+    return Vector(-10000.0 - static_cast<double>(nodeId), -10000.0, 0.0);
+}
+
+static uint32_t
+ResolveVehicleIdForNode(uint32_t nodeId)
+{
+    auto it = g_nodeIdToVehicleId.find(nodeId);
+    return (it == g_nodeIdToVehicleId.end()) ? kInvalidVehicleId : it->second;
+}
+
+static uint32_t
+ResolveNodeIdForVehicle(uint32_t vehicleId)
+{
+    auto it = g_vehicleIdToNodeId.find(vehicleId);
+    return (it == g_vehicleIdToNodeId.end()) ? std::numeric_limits<uint32_t>::max() : it->second;
+}
+
+static bool
+IsNodeAssignedToVehicle(uint32_t nodeId, uint32_t vehicleId)
+{
+    return ResolveVehicleIdForNode(nodeId) == vehicleId;
+}
+
 static bool
 IsNodeActiveAtTime(uint32_t nodeId, double timeS)
 {
+    if (g_dynamicActivePoolEnabled)
+    {
+        (void)timeS;
+        return ResolveVehicleIdForNode(nodeId) != kInvalidVehicleId;
+    }
+
     auto it = g_nodeIdToActiveTimeRangeS.find(nodeId);
     if (it == g_nodeIdToActiveTimeRangeS.end())
     {
@@ -270,6 +313,49 @@ ComputeMobilityTimeRangeForVehicles(const std::vector<uint32_t>& vehicleIds)
     NS_ABORT_MSG_IF(!std::isfinite(minTimeS) || !std::isfinite(maxTimeS),
                     "Cannot compute selected mobility coverage from empty vehicle set");
     return {minTimeS, maxTimeS};
+}
+
+static std::pair<uint32_t, uint32_t>
+ComputePeakActiveCountsForVehicles(const std::vector<uint32_t>& vehicleIds,
+                                   bool enableCoreFilter,
+                                   const std::string& coreAxis,
+                                   double coreMin,
+                                   double coreMax)
+{
+    std::map<double, std::set<uint32_t>> activeByTime;
+    std::map<double, std::set<uint32_t>> coreByTime;
+
+    for (uint32_t vehicleId : vehicleIds)
+    {
+        const auto vehIt = g_mobilityByVehicle.find(vehicleId);
+        if (vehIt == g_mobilityByVehicle.end())
+        {
+            continue;
+        }
+        for (const auto& row : vehIt->second)
+        {
+            activeByTime[row.timeS].insert(vehicleId);
+            if (!enableCoreFilter ||
+                IsInsideCoreRegion((coreAxis == "x") ? row.xM : row.yM, coreMin, coreMax))
+            {
+                coreByTime[row.timeS].insert(vehicleId);
+            }
+        }
+    }
+
+    uint32_t peakActive = 0;
+    for (const auto& kv : activeByTime)
+    {
+        peakActive = std::max<uint32_t>(peakActive, kv.second.size());
+    }
+
+    uint32_t peakCore = 0;
+    for (const auto& kv : coreByTime)
+    {
+        peakCore = std::max<uint32_t>(peakCore, kv.second.size());
+    }
+
+    return {peakActive, peakCore};
 }
 
 static std::pair<double, double>
@@ -371,6 +457,158 @@ GetCoreCoordinate(const Vector& position, const std::string& axis)
     return (axis == "x") ? position.x : position.y;
 }
 
+class NgsimPoolMobilityModel : public MobilityModel
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::NgsimPoolMobilityModel")
+                                .SetParent<MobilityModel>()
+                                .SetGroupName("Mobility")
+                                .AddConstructor<NgsimPoolMobilityModel>();
+        return tid;
+    }
+
+    void SetParkingPosition(const Vector& position)
+    {
+        m_parkingPosition = position;
+        if (!m_rows)
+        {
+            NotifyCourseChange();
+        }
+    }
+
+    void AssignVehicle(uint32_t vehicleId, const std::vector<MobilityRow>* rows)
+    {
+        NS_ABORT_MSG_IF(rows == nullptr || rows->empty(),
+                        "Cannot assign pool mobility to an empty vehicle track");
+        m_vehicleId = vehicleId;
+        m_rows = rows;
+        m_lastIndex = 0;
+        NotifyCourseChange();
+    }
+
+    void ReleaseVehicle()
+    {
+        m_vehicleId = kInvalidVehicleId;
+        m_rows = nullptr;
+        m_lastIndex = 0;
+        NotifyCourseChange();
+    }
+
+    bool IsAssigned() const
+    {
+        return m_rows != nullptr;
+    }
+
+    uint32_t GetVehicleId() const
+    {
+        return m_vehicleId;
+    }
+
+  private:
+    Vector InterpolatePosition(double timeS) const
+    {
+        if (!m_rows || m_rows->empty())
+        {
+            return m_parkingPosition;
+        }
+
+        const auto& rows = *m_rows;
+        if (timeS <= rows.front().timeS)
+        {
+            return Vector(rows.front().xM, rows.front().yM, 0.0);
+        }
+        if (timeS >= rows.back().timeS)
+        {
+            return Vector(rows.back().xM, rows.back().yM, 0.0);
+        }
+
+        while (m_lastIndex + 1 < rows.size() && rows[m_lastIndex + 1].timeS <= timeS)
+        {
+            m_lastIndex++;
+        }
+        while (m_lastIndex > 0 && rows[m_lastIndex].timeS > timeS)
+        {
+            m_lastIndex--;
+        }
+
+        const uint32_t nextIndex = std::min<uint32_t>(m_lastIndex + 1, rows.size() - 1);
+        const auto& a = rows[m_lastIndex];
+        const auto& b = rows[nextIndex];
+        const double dt = b.timeS - a.timeS;
+        if (dt <= 0.0)
+        {
+            return Vector(a.xM, a.yM, 0.0);
+        }
+        const double alpha = std::max(0.0, std::min(1.0, (timeS - a.timeS) / dt));
+        return Vector(a.xM + alpha * (b.xM - a.xM), a.yM + alpha * (b.yM - a.yM), 0.0);
+    }
+
+    Vector InterpolateVelocity(double timeS) const
+    {
+        if (!m_rows || m_rows->empty())
+        {
+            return Vector(0.0, 0.0, 0.0);
+        }
+
+        const auto& rows = *m_rows;
+        if (timeS <= rows.front().timeS)
+        {
+            return Vector(rows.front().vxMps, rows.front().vyMps, 0.0);
+        }
+        if (timeS >= rows.back().timeS)
+        {
+            return Vector(rows.back().vxMps, rows.back().vyMps, 0.0);
+        }
+
+        while (m_lastIndex + 1 < rows.size() && rows[m_lastIndex + 1].timeS <= timeS)
+        {
+            m_lastIndex++;
+        }
+        while (m_lastIndex > 0 && rows[m_lastIndex].timeS > timeS)
+        {
+            m_lastIndex--;
+        }
+
+        const uint32_t nextIndex = std::min<uint32_t>(m_lastIndex + 1, rows.size() - 1);
+        const auto& a = rows[m_lastIndex];
+        const auto& b = rows[nextIndex];
+        const double dt = b.timeS - a.timeS;
+        if (dt <= 0.0)
+        {
+            return Vector(a.vxMps, a.vyMps, 0.0);
+        }
+        const double alpha = std::max(0.0, std::min(1.0, (timeS - a.timeS) / dt));
+        return Vector(a.vxMps + alpha * (b.vxMps - a.vxMps),
+                      a.vyMps + alpha * (b.vyMps - a.vyMps),
+                      0.0);
+    }
+
+    Vector DoGetPosition() const override
+    {
+        return InterpolatePosition(Simulator::Now().GetSeconds());
+    }
+
+    void DoSetPosition(const Vector& position) override
+    {
+        m_parkingPosition = position;
+        NotifyCourseChange();
+    }
+
+    Vector DoGetVelocity() const override
+    {
+        return InterpolateVelocity(Simulator::Now().GetSeconds());
+    }
+
+    uint32_t m_vehicleId = kInvalidVehicleId;
+    const std::vector<MobilityRow>* m_rows = nullptr;
+    mutable uint32_t m_lastIndex = 0;
+    Vector m_parkingPosition = Vector(0.0, 0.0, 0.0);
+};
+
+NS_OBJECT_ENSURE_REGISTERED(NgsimPoolMobilityModel);
+
 static void
 LoadMobilityCsv(const std::string& path)
 {
@@ -419,6 +657,15 @@ LoadMobilityCsv(const std::string& path)
         row.laneId = static_cast<uint32_t>(std::stoul(token));
 
         g_mobilityByVehicle[row.vehicleId].push_back(row);
+    }
+
+    for (auto& kv : g_mobilityByVehicle)
+    {
+        std::sort(kv.second.begin(),
+                  kv.second.end(),
+                  [](const MobilityRow& a, const MobilityRow& b) {
+                      return a.timeS < b.timeS;
+                  });
     }
 
     std::cout << "Loaded vehicles from mobility CSV: " << g_mobilityByVehicle.size() << std::endl;
@@ -470,10 +717,7 @@ InstallWaypointMobility(Ptr<Node> node, const std::vector<MobilityRow>& rows)
     Ptr<WaypointMobilityModel> mob = CreateObject<WaypointMobilityModel>();
     node->AggregateObject(mob);
 
-    const Vector inactiveParkingPosition(
-        -10000.0 - static_cast<double>(node->GetId()),
-        -10000.0,
-        0.0);
+    const Vector inactiveParkingPosition = GetInactiveParkingPosition(node->GetId());
     constexpr double waypointEpsS = 1e-6;
 
     if (rows.front().timeS > 0.0)
@@ -546,8 +790,7 @@ class KpiLogger : public Object
                    bool enableCoreFilter,
                    const std::string& coreAxis,
                    double coreMin,
-                   double coreMax,
-                   double densityLengthM)
+                   double coreMax)
     {
         m_cbrLogger = cbrLogger;
         m_awarenessRangeM = awarenessRangeM;
@@ -559,13 +802,11 @@ class KpiLogger : public Object
         m_coreAxis = coreAxis;
         m_coreMin = coreMin;
         m_coreMax = coreMax;
-        m_densityLengthM = densityLengthM;
 
         for (uint32_t i = 0; i < nodes.GetN(); ++i)
         {
             Ptr<Node> n = nodes.Get(i);
             m_nodes.push_back(n);
-            m_nodeIds.insert(n->GetId());
         }
         m_out.open(csvPath.c_str(), std::ios::out | std::ios::trunc);
         if (!m_out.is_open())
@@ -573,44 +814,10 @@ class KpiLogger : public Object
             NS_FATAL_ERROR("Cannot open KPI output CSV: " << csvPath);
         }
         m_out << "time_s,tx_power_dbm,beacon_interval_s,"
-              << "active_vehicle_count_core,density_veh_per_km_core,"
-              << "mean_neighbors_150m,mean_neighbors_300m,"
-              << "prr_awareness,pir_s,cbr,sensing_exclusion_ratio\n";
-
-        std::string txLogPath = csvPath;
-        std::string rxLogPath = csvPath;
-
-        std::size_t pos = txLogPath.rfind(".csv");
-        if (pos != std::string::npos)
-        {
-            txLogPath.replace(pos, 4, "_tx_packet_log.csv");
-            rxLogPath.replace(pos, 4, "_rx_packet_log.csv");
-        }
-        else
-        {
-            txLogPath += "_tx_packet_log.csv";
-            rxLogPath += "_rx_packet_log.csv";
-        }
-
-        m_txOut.open(txLogPath.c_str(), std::ios::out | std::ios::trunc);
-        if (!m_txOut.is_open())
-        {
-            NS_FATAL_ERROR("Cannot open TX packet log CSV: " << txLogPath);
-        }
-        m_txOut << "time_s,tx_node_id,seq,tx_x_m,tx_y_m,eligible_rx_count_awareness";
-        for (uint32_t i = 0; i + 1 < m_distanceBinEdgesM.size(); ++i)
-        {
-            m_txOut << "," << BuildDistanceBinColumnName(i);
-        }
-        m_txOut << "\n";
-
-        m_rxOut.open(rxLogPath.c_str(), std::ios::out | std::ios::trunc);
-        if (!m_rxOut.is_open())
-        {
-            NS_FATAL_ERROR("Cannot open RX packet log CSV: " << rxLogPath);
-        }
-        m_rxOut << "time_s,tx_node_id,rx_node_id,seq,tx_x_m,tx_y_m,rx_x_m,rx_y_m,"
-                << "distance_m,rx_distance_m,pir_s,delay_s\n";
+                << "active_vehicle_count_core,"
+                << "tx_count,eligible_count,success_count,"
+                << "mean_eligible_per_tx,mean_success_per_tx,"
+                << "prr_awareness,pir_s,pir_count,cbr\n";
     }
 
     void RegisterNodeIpv4(uint32_t nodeId, const Ipv4Address& addr)
@@ -634,27 +841,16 @@ class KpiLogger : public Object
         m_currentTb = tbS;
     }
 
-    bool HasLatestSample() const
-    {
-        return m_hasLatestSample;
-    }
-
-    KpiSample GetLatestSample() const
-    {
-        return m_latestSample;
-    }
-
-    void LogTx(uint32_t txNodeId, uint64_t seq, Time tTx, const Vector& posTx)
+    void LogTx(uint32_t txVehicleId, uint32_t txNodeId, uint64_t seq, Time tTx, const Vector& posTx)
     {
         const double timeS = tTx.GetSeconds();
-        if (!IsNodeActiveAtTime(txNodeId, timeS) || !IsInsideEvaluationWindow(timeS) ||
+        if (txVehicleId == kInvalidVehicleId || !IsNodeActiveAtTime(txNodeId, timeS) ||
+            !IsNodeAssignedToVehicle(txNodeId, txVehicleId) || !IsInsideEvaluationWindow(timeS) ||
             !IsInsideCore(posTx))
         {
             return;
         }
 
-        uint32_t eligible = 0;
-        std::vector<uint32_t> eligibleByBin(m_distanceBinEdgesM.size() - 1, 0);
         std::map<uint32_t, double> rxDistanceAtTxM;
 
         for (const auto& node : m_nodes)
@@ -667,6 +863,11 @@ class KpiLogger : public Object
             {
                 continue;
             }
+            const uint32_t rxVehicleId = ResolveVehicleIdForNode(node->GetId());
+            if (rxVehicleId == kInvalidVehicleId || rxVehicleId == txVehicleId)
+            {
+                continue;
+            }
 
             Vector posRx = node->GetObject<MobilityModel>()->GetPosition();
             if (!IsInsideCore(posRx))
@@ -675,77 +876,59 @@ class KpiLogger : public Object
             }
 
             const double distanceM = Distance2d(posTx, posRx);
-            const int bin = GetDistanceBinIndex(distanceM);
-            if (bin >= 0)
-            {
-                eligibleByBin[static_cast<uint32_t>(bin)]++;
-                rxDistanceAtTxM[node->GetId()] = distanceM;
-            }
-
             if (distanceM <= m_awarenessRangeM)
             {
-                eligible++;
+                rxDistanceAtTxM[rxVehicleId] = distanceM;
             }
         }
 
         TxEvent ev;
         ev.timeS = timeS;
-        ev.txNodeId = txNodeId;
+        ev.txVehicleId = txVehicleId;
         ev.seq = seq;
-        ev.posTx = posTx;
-        ev.eligibleRxCount = eligible;
-        ev.eligibleRxCountsByBin = eligibleByBin;
+        ev.eligibleRxCount = static_cast<uint32_t>(rxDistanceAtTxM.size());
         ev.rxDistanceAtTxM = rxDistanceAtTxM;
 
         m_txEvents.push_back(ev);
 
-        if (m_txOut.is_open())
-        {
-            m_txOut << std::fixed << std::setprecision(6)
-                    << ev.timeS << ","
-                    << ev.txNodeId << ","
-                    << ev.seq << ","
-                    << ev.posTx.x << ","
-                    << ev.posTx.y << ","
-                    << ev.eligibleRxCount;
-            for (const auto& count : ev.eligibleRxCountsByBin)
-            {
-                m_txOut << "," << count;
-            }
-            m_txOut << "\n";
-            m_txOut.flush();
-        }
-
         PruneOldEvents();
     }
 
-    void LogRx(uint32_t txNodeId,
-           uint32_t rxNodeId,
+    void LogRx(uint32_t txVehicleId,
+           uint32_t rxVehicleId,
            uint64_t seq,
            Time tRx,
-           const Vector& posTx,
-           const Vector& posRx,
-           double delayS)
+           const Vector& posRx)
     {
         const double timeS = tRx.GetSeconds();
-        if (!IsInsideEvaluationWindow(timeS) || !IsNodeActiveAtTime(txNodeId, timeS) ||
-            !IsNodeActiveAtTime(rxNodeId, timeS))
+        const uint32_t txNodeId = ResolveNodeIdForVehicle(txVehicleId);
+        const uint32_t rxNodeId = ResolveNodeIdForVehicle(rxVehicleId);
+        if (!IsInsideEvaluationWindow(timeS) || txNodeId == std::numeric_limits<uint32_t>::max() ||
+            rxNodeId == std::numeric_limits<uint32_t>::max() ||
+            !IsNodeActiveAtTime(txNodeId, timeS) || !IsNodeActiveAtTime(rxNodeId, timeS) ||
+            !IsNodeAssignedToVehicle(txNodeId, txVehicleId) ||
+            !IsNodeAssignedToVehicle(rxNodeId, rxVehicleId))
         {
             return;
         }
 
-        const TxEvent* txEvent = FindTxEvent(txNodeId, seq);
+        const TxEvent* txEvent = FindTxEvent(txVehicleId, seq);
         if (!txEvent)
         {
             return;
         }
 
-        if (!IsInsideCore(txEvent->posTx) || !IsInsideCore(posRx))
+        if (!IsInsideCore(posRx))
+        {
+            return;
+        }
+        auto distIt = txEvent->rxDistanceAtTxM.find(rxVehicleId);
+        if (distIt == txEvent->rxDistanceAtTxM.end())
         {
             return;
         }
 
-        auto rxTriple = std::make_tuple(txNodeId, rxNodeId, seq);
+        auto rxTriple = std::make_tuple(txVehicleId, rxVehicleId, seq);
         if (m_loggedRxTriples.find(rxTriple) != m_loggedRxTriples.end())
         {
             return;
@@ -753,7 +936,7 @@ class KpiLogger : public Object
         m_loggedRxTriples.insert(rxTriple);
 
         double pir = std::numeric_limits<double>::quiet_NaN();
-        auto key = std::make_pair(txNodeId, rxNodeId);
+        auto key = std::make_pair(txVehicleId, rxVehicleId);
 
         auto it = m_lastRxTimePerPair.find(key);
         if (it != m_lastRxTimePerPair.end())
@@ -762,55 +945,14 @@ class KpiLogger : public Object
         }
         m_lastRxTimePerPair[key] = tRx.GetSeconds();
 
-        Vector txPosAtTx = txEvent->posTx;
-        double distanceAtTxM = Distance2d(txEvent->posTx, posRx);
-        auto distIt = txEvent->rxDistanceAtTxM.find(rxNodeId);
-        if (distIt != txEvent->rxDistanceAtTxM.end())
-        {
-            distanceAtTxM = distIt->second;
-        }
-
-        const double distanceAtRxM = Distance2d(posTx, posRx);
-
         RxEvent ev;
         ev.timeS = timeS;
-        ev.txNodeId = txNodeId;
-        ev.rxNodeId = rxNodeId;
+        ev.txVehicleId = txVehicleId;
+        ev.rxVehicleId = rxVehicleId;
         ev.seq = seq;
-        ev.posTx = txPosAtTx;
-        ev.posRx = posRx;
-        ev.distanceAtTxM = distanceAtTxM;
-        ev.distanceAtRxM = distanceAtRxM;
         ev.pirS = pir;
-        ev.delayS = delayS;
 
         m_rxEvents.push_back(ev);
-
-        if (m_rxOut.is_open())
-        {
-            m_rxOut << std::fixed << std::setprecision(6)
-                    << ev.timeS << ","
-                    << ev.txNodeId << ","
-                    << ev.rxNodeId << ","
-                    << ev.seq << ","
-                    << ev.posTx.x << ","
-                    << ev.posTx.y << ","
-                    << ev.posRx.x << ","
-                    << ev.posRx.y << ","
-                    << ev.distanceAtTxM << ","
-                    << ev.distanceAtRxM << ",";
-
-            if (std::isnan(ev.pirS))
-            {
-                m_rxOut << "nan,";
-            }
-            else
-            {
-                m_rxOut << ev.pirS << ",";
-            }
-            m_rxOut << ev.delayS << "\n";
-            m_rxOut.flush();
-        }
 
         PruneOldEvents();
     }
@@ -826,16 +968,15 @@ class KpiLogger : public Object
         for (const auto& tx : m_txEvents)
         {
             denom += tx.eligibleRxCount;
-            activeTxKeys.insert(std::make_tuple(tx.txNodeId, tx.seq));
+            activeTxKeys.insert(std::make_tuple(tx.txVehicleId, tx.seq));
         }
 
         std::set<std::tuple<uint32_t, uint32_t, uint64_t>> uniqueRxTriples;
         for (const auto& rx : m_rxEvents)
         {
-            if (activeTxKeys.find(std::make_tuple(rx.txNodeId, rx.seq)) != activeTxKeys.end() &&
-                rx.distanceAtTxM <= m_awarenessRangeM)
+            if (activeTxKeys.find(std::make_tuple(rx.txVehicleId, rx.seq)) != activeTxKeys.end())
             {
-                uniqueRxTriples.insert(std::make_tuple(rx.txNodeId, rx.rxNodeId, rx.seq));
+                uniqueRxTriples.insert(std::make_tuple(rx.txVehicleId, rx.rxVehicleId, rx.seq));
             }
         }
 
@@ -855,38 +996,56 @@ class KpiLogger : public Object
         pirMean = (pirCount > 0) ? pirMean / static_cast<double>(pirCount) : 0.0;
 
         const double cbr = m_cbrLogger ? m_cbrLogger->ComputeCbr(now) : 0.0;
-        const double sensingExclusionRatio =
-            m_cbrLogger ? m_cbrLogger->ComputeSensingExclusionRatio(now) : 0.0;
-        const TrafficContext traffic = ComputeTrafficContext();
+        const uint32_t activeVehicleCount = CountActiveCoreVehicles(now);
+        MaybePrintProgress(now, activeVehicleCount);
+
+        const uint64_t txCount = m_txEvents.size();
+
+        const double meanEligiblePerTx =
+            (txCount > 0)
+                ? static_cast<double>(denom) / static_cast<double>(txCount)
+                : 0.0;
+
+        const double meanSuccessPerTx =
+            (txCount > 0)
+                ? static_cast<double>(numer) / static_cast<double>(txCount)
+                : 0.0;
 
         m_latestSample.timeS = now;
         m_latestSample.txPowerDbm = m_currentP;
         m_latestSample.beaconIntervalS = m_currentTb;
-        m_latestSample.activeVehicleCountCore = traffic.activeVehicleCount;
-        m_latestSample.densityVehPerKmCore = traffic.densityVehPerKm;
-        m_latestSample.meanNeighbors150m = traffic.meanNeighbors150m;
-        m_latestSample.meanNeighbors300m = traffic.meanNeighbors300m;
+        m_latestSample.activeVehicleCountCore = activeVehicleCount;
         m_latestSample.prrAwareness = prr;
         m_latestSample.pirS = pirMean;
         m_latestSample.cbr = cbr;
-        m_latestSample.sensingExclusionRatio = sensingExclusionRatio;
         m_hasLatestSample = true;
 
         m_out << std::fixed << std::setprecision(6) << now << ","
-              << m_currentP << ","
-              << m_currentTb << ","
-              << traffic.activeVehicleCount << ","
-              << traffic.densityVehPerKm << ","
-              << traffic.meanNeighbors150m << ","
-              << traffic.meanNeighbors300m << ","
-              << prr << ","
-              << pirMean << ","
-              << cbr << ","
-              << sensingExclusionRatio << "\n";
-
+                << m_currentP << ","
+                << m_currentTb << ","
+                << activeVehicleCount << ","
+                << txCount << ","
+                << denom << ","
+                << numer << ","
+                << meanEligiblePerTx << ","
+                << meanSuccessPerTx << ","
+                << prr << ","
+                << pirMean << ","
+                << pirCount << ","
+                << cbr << "\n";
         m_out.flush();
 
         Simulator::Schedule(Seconds(m_sampleTimeS), &KpiLogger::SampleAndWrite, this);
+    }
+
+    bool HasLatestSample() const
+    {
+        return m_hasLatestSample;
+    }
+
+    KpiSample GetLatestSample() const
+    {
+        return m_latestSample;
     }
 
     ~KpiLogger() override
@@ -895,83 +1054,39 @@ class KpiLogger : public Object
         {
             m_out.close();
         }
-        if (m_txOut.is_open())
-        {
-            m_txOut.close();
-        }
-        if (m_rxOut.is_open())
-        {
-            m_rxOut.close();
-        }
     }
 
   private:
-    struct TrafficContext
+    uint32_t CountActiveCoreVehicles(double timeS) const
     {
-        uint32_t activeVehicleCount = 0;
-        double densityVehPerKm = 0.0;
-        double meanNeighbors150m = 0.0;
-        double meanNeighbors300m = 0.0;
-    };
-
-    TrafficContext ComputeTrafficContext() const
-    {
-        std::vector<Vector> activePositions;
-        activePositions.reserve(m_nodes.size());
-
+        uint32_t count = 0;
         for (const auto& node : m_nodes)
         {
-            if (!IsNodeActiveAtTime(node->GetId(), Simulator::Now().GetSeconds()))
+            if (!IsNodeActiveAtTime(node->GetId(), timeS))
+            {
+                continue;
+            }
+            if (ResolveVehicleIdForNode(node->GetId()) == kInvalidVehicleId)
             {
                 continue;
             }
             const Vector pos = node->GetObject<MobilityModel>()->GetPosition();
             if (IsInsideCore(pos))
             {
-                activePositions.push_back(pos);
+                count++;
             }
         }
+        return count;
+    }
 
-        TrafficContext context;
-        context.activeVehicleCount = static_cast<uint32_t>(activePositions.size());
-        if (m_densityLengthM > 0.0)
+    void MaybePrintProgress(double timeS, uint32_t activeVehicleCount)
+    {
+        const int64_t second = static_cast<int64_t>(std::floor(timeS + 1e-9));
+        if (second >= 1 && second != m_lastProgressSecond)
         {
-            context.densityVehPerKm =
-                static_cast<double>(context.activeVehicleCount) / (m_densityLengthM / 1000.0);
+            std::cout << "t=" << second << ", v=" << activeVehicleCount << std::endl;
+            m_lastProgressSecond = second;
         }
-
-        if (activePositions.empty())
-        {
-            return context;
-        }
-
-        uint64_t neighborCount150m = 0;
-        uint64_t neighborCount300m = 0;
-        for (uint32_t i = 0; i < activePositions.size(); ++i)
-        {
-            for (uint32_t j = 0; j < activePositions.size(); ++j)
-            {
-                if (i == j)
-                {
-                    continue;
-                }
-
-                const double distanceM = Distance2d(activePositions[i], activePositions[j]);
-                if (distanceM <= 150.0)
-                {
-                    neighborCount150m++;
-                }
-                if (distanceM <= 300.0)
-                {
-                    neighborCount300m++;
-                }
-            }
-        }
-
-        const double activeCount = static_cast<double>(activePositions.size());
-        context.meanNeighbors150m = static_cast<double>(neighborCount150m) / activeCount;
-        context.meanNeighbors300m = static_cast<double>(neighborCount300m) / activeCount;
-        return context;
     }
 
     void PruneOldEvents()
@@ -986,12 +1101,12 @@ class KpiLogger : public Object
         }
         for (const auto& tx : m_txEvents)
         {
-            activeTxKeys.insert(std::make_tuple(tx.txNodeId, tx.seq));
+            activeTxKeys.insert(std::make_tuple(tx.txVehicleId, tx.seq));
         }
         while (!m_rxEvents.empty() && m_rxEvents.front().timeS < cutoff)
         {
-            m_loggedRxTriples.erase(std::make_tuple(m_rxEvents.front().txNodeId,
-                                                    m_rxEvents.front().rxNodeId,
+            m_loggedRxTriples.erase(std::make_tuple(m_rxEvents.front().txVehicleId,
+                                                    m_rxEvents.front().rxVehicleId,
                                                     m_rxEvents.front().seq));
             m_rxEvents.pop_front();
         }
@@ -999,42 +1114,18 @@ class KpiLogger : public Object
                                         m_rxEvents.end(),
                                         [this, &activeTxKeys](const RxEvent& rx) {
                                             const auto txKey =
-                                                std::make_tuple(rx.txNodeId, rx.seq);
+                                                std::make_tuple(rx.txVehicleId, rx.seq);
                                             if (activeTxKeys.find(txKey) != activeTxKeys.end())
                                             {
                                                 return false;
                                             }
 
-                                            m_loggedRxTriples.erase(std::make_tuple(rx.txNodeId,
-                                                                                    rx.rxNodeId,
+                                            m_loggedRxTriples.erase(std::make_tuple(rx.txVehicleId,
+                                                                                    rx.rxVehicleId,
                                                                                     rx.seq));
                                             return true;
                                         }),
                          m_rxEvents.end());
-    }
-
-    int GetDistanceBinIndex(double distanceM) const
-    {
-        for (uint32_t i = 0; i + 1 < m_distanceBinEdgesM.size(); ++i)
-        {
-            const double low = m_distanceBinEdgesM[i];
-            const double high = m_distanceBinEdgesM[i + 1];
-            const bool isLastBin = (i + 2 == m_distanceBinEdgesM.size());
-            if (distanceM >= low && (distanceM < high || (isLastBin && distanceM <= high)))
-            {
-                return static_cast<int>(i);
-            }
-        }
-        return -1;
-    }
-
-    std::string BuildDistanceBinColumnName(uint32_t index) const
-    {
-        std::ostringstream os;
-        os << "eligible_"
-           << static_cast<uint32_t>(m_distanceBinEdgesM[index]) << "_"
-           << static_cast<uint32_t>(m_distanceBinEdgesM[index + 1]) << "m";
-        return os.str();
     }
 
     bool IsInsideEvaluationWindow(double timeS) const
@@ -1048,11 +1139,11 @@ class KpiLogger : public Object
                IsInsideCoreRegion(GetCoreCoordinate(position, m_coreAxis), m_coreMin, m_coreMax);
     }
 
-    const TxEvent* FindTxEvent(uint32_t txNodeId, uint64_t seq) const
+    const TxEvent* FindTxEvent(uint32_t txVehicleId, uint64_t seq) const
     {
         for (auto it = m_txEvents.rbegin(); it != m_txEvents.rend(); ++it)
         {
-            if (it->txNodeId == txNodeId && it->seq == seq)
+            if (it->txVehicleId == txVehicleId && it->seq == seq)
             {
                 return &(*it);
             }
@@ -1063,24 +1154,22 @@ class KpiLogger : public Object
 
     double m_awarenessRangeM = 150.0;
     double m_kpiWindowS = 1.0;
-    double m_sampleTimeS = 0.1;
+    double m_sampleTimeS = 0.5;
     double m_evalStartS = 0.0;
     double m_evalEndS = -1.0;
     bool m_enableCoreFilter = true;
     std::string m_coreAxis = "y";
     double m_coreMin = 0.0;
     double m_coreMax = 0.0;
-    double m_densityLengthM = 1.0;
     CbrLogger* m_cbrLogger = nullptr;
 
     double m_currentP = 23.0;
     double m_currentTb = 0.1;
     bool m_hasLatestSample = false;
     KpiSample m_latestSample;
-    std::vector<double> m_distanceBinEdgesM = {0.0, 50.0, 100.0, 150.0, 200.0, 300.0};
+    int64_t m_lastProgressSecond = -1;
 
     std::vector<Ptr<Node>> m_nodes;
-    std::set<uint32_t> m_nodeIds;
     std::unordered_map<uint32_t, uint32_t> m_ipToNodeId;
 
     std::deque<TxEvent> m_txEvents;
@@ -1089,8 +1178,6 @@ class KpiLogger : public Object
     std::map<std::pair<uint32_t, uint32_t>, double> m_lastRxTimePerPair;
 
     std::ofstream m_out;
-    std::ofstream m_txOut;
-    std::ofstream m_rxOut;
 };
 
 class NgsimVehicleDataProvider : public VDP
@@ -1302,17 +1389,13 @@ class CamApplication : public Application
   public:
     void Setup(Ptr<Node> node,
                Ptr<KpiLogger> logger,
-               Ipv4Address localIpv4,
                Ipv4Address groupIpv4,
-               uint16_t port,
-               uint32_t maxCamSizeBytes)
+               uint16_t port)
     {
         m_node = node;
         m_logger = logger;
-        m_localIpv4 = localIpv4;
         m_groupIpv4 = groupIpv4;
         m_port = port;
-        m_maxCamSizeBytes = maxCamSizeBytes;
     }
 
     void SetBeaconInterval(double tb)
@@ -1328,6 +1411,31 @@ class CamApplication : public Application
     void SetEtsiCamGeneration(bool enable)
     {
         m_useEtsiCamGeneration = enable;
+    }
+
+    void AssignVehicle(uint32_t vehicleId)
+    {
+        m_assignedVehicleId = vehicleId;
+        if (m_running)
+        {
+            ConfigureVehicleServiceState();
+            StartCamIfReady();
+        }
+    }
+
+    void ReleaseVehicle()
+    {
+        StopCamIfRunning();
+        m_assignedVehicleId = kInvalidVehicleId;
+        if (m_running)
+        {
+            ConfigureVehicleServiceState();
+        }
+    }
+
+    uint32_t GetAssignedVehicleId() const
+    {
+        return m_assignedVehicleId;
     }
 
   protected:
@@ -1355,9 +1463,7 @@ class CamApplication : public Application
         m_btp->setGeoNet(m_geoNet);
 
         m_caService.setBTP(m_btp);
-        m_caService.setVDP(m_vdp.get());
-        m_btp->setVDP(m_vdp.get());
-        m_caService.setStationProperties(m_node->GetId(), StationType_passengerCar);
+        ConfigureVehicleServiceState();
         m_caService.setRealTime(false);
         m_caService.setSocketTx(m_socket);
         m_caService.setSocketRx(m_socket);
@@ -1370,14 +1476,13 @@ class CamApplication : public Application
                       std::placeholders::_2,
                       std::placeholders::_3));
 
-        const double desyncS = GetDeterministicDesync();
-        m_caService.startCamDissemination(desyncS);
+        StartCamIfReady();
     }
 
     void StopApplication() override
     {
         m_running = false;
-        m_caService.terminateDissemination();
+        StopCamIfRunning();
 
         if (m_socket)
         {
@@ -1389,7 +1494,7 @@ class CamApplication : public Application
   private:
     void TagAndLogTx(Ptr<Packet> packet)
     {
-        if (!m_running || !packet)
+        if (!m_running || m_assignedVehicleId == kInvalidVehicleId || !packet)
         {
             return;
         }
@@ -1398,21 +1503,24 @@ class CamApplication : public Application
         KpiPacketTag kpiTag;
         kpiTag.SetSequence(kpiSeq);
         kpiTag.SetTxTimeNs(Simulator::Now().GetNanoSeconds());
+        kpiTag.SetTxVehicleId(m_assignedVehicleId);
         packet->AddPacketTag(kpiTag);
 
         Vector pos = m_node->GetObject<MobilityModel>()->GetPosition();
-        m_logger->LogTx(m_node->GetId(), kpiSeq, Simulator::Now(), pos);
+        m_logger->LogTx(m_assignedVehicleId, m_node->GetId(), kpiSeq, Simulator::Now(), pos);
     }
 
     double GetDeterministicDesync() const
     {
-        const double fractional = std::fmod((m_node->GetId() + 1) * 0.6180339887498948, 1.0);
+        const uint32_t identity =
+            (m_assignedVehicleId == kInvalidVehicleId) ? m_node->GetId() : m_assignedVehicleId;
+        const double fractional = std::fmod((identity + 1) * 0.6180339887498948, 1.0);
         return fractional * std::max(0.1, m_tGenCamMaxS);
     }
 
     void ReceiveCam(asn1cpp::Seq<CAM> cam, Address from, Ptr<Packet> packet)
     {
-        if (!packet || packet->GetSize() == 0)
+        if (m_assignedVehicleId == kInvalidVehicleId || !packet || packet->GetSize() == 0)
         {
             return;
         }
@@ -1431,31 +1539,65 @@ class CamApplication : public Application
             return;
         }
         const uint64_t kpiSeq = kpiTag.GetSequence();
-        const double delayS =
-            static_cast<double>(Simulator::Now().GetNanoSeconds() - kpiTag.GetTxTimeNs()) / 1e9;
+        const uint32_t txVehicleId = kpiTag.GetTxVehicleId();
         const uint32_t stationId = asn1cpp::getField(cam->header.stationId, uint32_t);
 
-        if (stationId != txNodeId)
+        if (txVehicleId == kInvalidVehicleId || stationId != txVehicleId ||
+            !IsNodeAssignedToVehicle(txNodeId, txVehicleId))
         {
             return;
         }
 
-        Ptr<Node> txNode = g_nodeIdToNode[txNodeId];
-        if (!txNode)
-        {
-            return;
-        }
-
-        Vector posTx = txNode->GetObject<MobilityModel>()->GetPosition();
         Vector posRx = m_node->GetObject<MobilityModel>()->GetPosition();
 
-        m_logger->LogRx(txNodeId,
-                        m_node->GetId(),
+        m_logger->LogRx(txVehicleId,
+                        m_assignedVehicleId,
                         kpiSeq,
                         Simulator::Now(),
-                        posTx,
-                        posRx,
-                        delayS);
+                        posRx);
+    }
+
+    void ConfigureVehicleServiceState()
+    {
+        if (!m_btp || !m_geoNet)
+        {
+            return;
+        }
+
+        if (!m_vdp)
+        {
+            m_vdp = std::make_unique<NgsimVehicleDataProvider>(m_node);
+        }
+        m_caService.setVDP(m_vdp.get());
+        m_btp->setVDP(m_vdp.get());
+
+        const uint32_t stationId =
+            (m_assignedVehicleId == kInvalidVehicleId) ? m_node->GetId() : m_assignedVehicleId;
+        m_caService.setStationProperties(stationId, StationType_passengerCar);
+    }
+
+    void StartCamIfReady()
+    {
+        if (!m_running || m_disseminating || m_assignedVehicleId == kInvalidVehicleId)
+        {
+            return;
+        }
+
+        m_caService.setStationProperties(m_assignedVehicleId, StationType_passengerCar);
+        const double desyncS = GetDeterministicDesync();
+        m_caService.startCamDissemination(desyncS);
+        m_disseminating = true;
+    }
+
+    void StopCamIfRunning()
+    {
+        if (!m_disseminating)
+        {
+            return;
+        }
+
+        m_caService.terminateDissemination();
+        m_disseminating = false;
     }
 
     Ptr<Node> m_node;
@@ -1467,19 +1609,119 @@ class CamApplication : public Application
     std::unique_ptr<NgsimVehicleDataProvider> m_vdp;
 
     bool m_running = false;
+    bool m_disseminating = false;
     bool m_useEtsiCamGeneration = true;
+    uint32_t m_assignedVehicleId = kInvalidVehicleId;
 
     double m_tGenCamMaxS = 1.0;
-    uint32_t m_maxCamSizeBytes = 300;
 
     uint64_t m_nextKpiSequence = 0;
 
-    Ipv4Address m_localIpv4;
     Ipv4Address m_groupIpv4;
     uint16_t m_port = 8000;
 };
 
 static std::map<uint32_t, Ptr<CamApplication>> g_apps;
+
+static void
+AssignVehicleToPool(uint32_t vehicleId)
+{
+    NS_ABORT_MSG_IF(!g_dynamicActivePoolEnabled,
+                    "AssignVehicleToPool called while dynamic active pool is disabled");
+    NS_ABORT_MSG_IF(g_vehicleIdToNodeId.find(vehicleId) != g_vehicleIdToNodeId.end(),
+                    "Vehicle " << vehicleId << " is already assigned to a pool UE");
+    NS_ABORT_MSG_IF(g_freePoolNodeIds.empty(),
+                    "Dynamic active pool exhausted while assigning vehicle "
+                        << vehicleId << ". Increase --physicalUePoolSize.");
+
+    auto rowsIt = g_mobilityByVehicle.find(vehicleId);
+    NS_ABORT_MSG_IF(rowsIt == g_mobilityByVehicle.end() || rowsIt->second.empty(),
+                    "Cannot assign missing/empty mobility track for vehicle " << vehicleId);
+
+    const uint32_t nodeId = g_freePoolNodeIds.front();
+    g_freePoolNodeIds.pop_front();
+
+    auto mobilityIt = g_nodeIdToPoolMobility.find(nodeId);
+    NS_ABORT_MSG_IF(mobilityIt == g_nodeIdToPoolMobility.end() || !mobilityIt->second,
+                    "Missing pool mobility model for node " << nodeId);
+
+    g_vehicleIdToNodeId[vehicleId] = nodeId;
+    g_nodeIdToVehicleId[nodeId] = vehicleId;
+    g_activeVehicleIds.insert(vehicleId);
+    mobilityIt->second->AssignVehicle(vehicleId, &rowsIt->second);
+
+    auto appIt = g_apps.find(nodeId);
+    if (appIt != g_apps.end() && appIt->second)
+    {
+        appIt->second->AssignVehicle(vehicleId);
+    }
+}
+
+static void
+ReleaseVehicleFromPool(uint32_t vehicleId)
+{
+    NS_ABORT_MSG_IF(!g_dynamicActivePoolEnabled,
+                    "ReleaseVehicleFromPool called while dynamic active pool is disabled");
+
+    auto assignedIt = g_vehicleIdToNodeId.find(vehicleId);
+    if (assignedIt == g_vehicleIdToNodeId.end())
+    {
+        return;
+    }
+
+    const uint32_t nodeId = assignedIt->second;
+    auto appIt = g_apps.find(nodeId);
+    if (appIt != g_apps.end() && appIt->second)
+    {
+        appIt->second->ReleaseVehicle();
+    }
+
+    auto mobilityIt = g_nodeIdToPoolMobility.find(nodeId);
+    if (mobilityIt != g_nodeIdToPoolMobility.end() && mobilityIt->second)
+    {
+        mobilityIt->second->ReleaseVehicle();
+    }
+
+    g_vehicleIdToNodeId.erase(assignedIt);
+    g_nodeIdToVehicleId.erase(nodeId);
+    g_activeVehicleIds.erase(vehicleId);
+    g_freePoolNodeIds.push_back(nodeId);
+}
+
+static void
+AssignInitialDynamicPoolVehicles(const std::vector<uint32_t>& vehicleIds, double initialTimeS)
+{
+    for (uint32_t vehicleId : vehicleIds)
+    {
+        const auto range = ComputeMobilityTimeRange(g_mobilityByVehicle[vehicleId]);
+        if (range.first <= initialTimeS + kAssignmentEpsS &&
+            range.second + kAssignmentEpsS >= initialTimeS)
+        {
+            AssignVehicleToPool(vehicleId);
+        }
+    }
+}
+
+static void
+ScheduleDynamicPoolAssignments(const std::vector<uint32_t>& vehicleIds,
+                               double initialTimeS,
+                               double simTimeSeconds)
+{
+    for (uint32_t vehicleId : vehicleIds)
+    {
+        const auto range = ComputeMobilityTimeRange(g_mobilityByVehicle[vehicleId]);
+        if (range.first > initialTimeS + kAssignmentEpsS && range.first <= simTimeSeconds)
+        {
+            Simulator::Schedule(Seconds(range.first), &AssignVehicleToPool, vehicleId);
+        }
+
+        const double releaseTimeS = range.second + kAssignmentEpsS;
+        if (releaseTimeS > initialTimeS + kAssignmentEpsS && releaseTimeS <= simTimeSeconds)
+        {
+            Simulator::Schedule(Seconds(releaseTimeS), &ReleaseVehicleFromPool, vehicleId);
+        }
+    }
+}
 
 static void
 ApplyTxPowerToAllUes(const NetDeviceContainer& ueDevs, double pDbm)
@@ -1508,6 +1750,16 @@ ApplyInputsAtTime(Ptr<KpiLogger> logger, NetDeviceContainer ueDevs, double pDbm,
         kv.second->SetBeaconInterval(tbS);
     }
 
+    ApplyTxPowerToAllUes(ueDevs, pDbm);
+}
+
+static void
+ApplyTxPowerAtTime(Ptr<KpiLogger> logger,
+                   const NetDeviceContainer& ueDevs,
+                   double pDbm,
+                   double fixedBeaconIntervalS)
+{
+    logger->SetCurrentInputs(pDbm, fixedBeaconIntervalS);
     ApplyTxPowerToAllUes(ueDevs, pDbm);
 }
 
@@ -1558,9 +1810,6 @@ ScheduleInputUpdates(Ptr<KpiLogger> logger, const NetDeviceContainer& ueDevs)
 static void
 ConnectCbrTraces(CbrLogger* cbrLogger)
 {
-    Config::Connect("/NodeList/*/DeviceList/*/ComponentCarrierMapUe/*/NrUeMac/SensingAlgorithm",
-                    MakeCallback(&CbrLogger::RecordSensingAlgorithm, cbrLogger));
-
     Config::Connect("/NodeList/*/DeviceList/*/ComponentCarrierMapUe/*/NrUePhy/NrSpectrumPhy/"
                     "ChannelOccupied",
                     MakeCallback(&CbrLogger::RecordChannelOccupied, cbrLogger));
@@ -1580,50 +1829,6 @@ DeriveSidecarPath(const std::string& csvPath, const std::string& suffix)
         path += suffix;
     }
     return path;
-}
-
-static bool
-StartsWithPathPrefix(const std::string& path, const std::string& prefix)
-{
-    return path.size() >= prefix.size() && path.compare(0, prefix.size(), prefix) == 0;
-}
-
-static bool
-IsProtectedDeepcOutputPath(const std::string& path)
-{
-    return path == "data/output/kpi_timeseries_10min_250veh_run01.csv" ||
-           path == "data/output/cbr_timeseries_10min_250veh_run01.csv" ||
-           StartsWithPathPrefix(path, "data/output/deepc_open_loop_250veh/") ||
-           path == "data/output/deepc_open_loop_250veh";
-}
-
-static void
-ValidateSafeOutputPaths(const std::string& kpiCsv,
-                        const std::string& cbrCsv,
-                        bool allowProtectedOutput)
-{
-    NS_ABORT_MSG_IF(kpiCsv == cbrCsv,
-                    "kpiCsv and cbrCsv must be different files to avoid overwriting outputs");
-
-    if (allowProtectedOutput)
-    {
-        return;
-    }
-
-    NS_ABORT_MSG_IF(IsProtectedDeepcOutputPath(kpiCsv),
-                    "Refusing to write KPI output to protected DeePC data path: "
-                        << kpiCsv
-                        << ". Use a new output path or pass --allowProtectedOutput=true.");
-    NS_ABORT_MSG_IF(IsProtectedDeepcOutputPath(cbrCsv),
-                    "Refusing to write CBR output to protected DeePC data path: "
-                        << cbrCsv
-                        << ". Use a new output path or pass --allowProtectedOutput=true.");
-
-    const std::string metadataPath = DeriveSidecarPath(kpiCsv, "_metadata.json");
-    NS_ABORT_MSG_IF(IsProtectedDeepcOutputPath(metadataPath),
-                    "Refusing to write metadata output to protected DeePC data path: "
-                        << metadataPath
-                        << ". Use a new kpiCsv path or pass --allowProtectedOutput=true.");
 }
 
 static std::string
@@ -1677,30 +1882,23 @@ ExtractJsonNumber(const std::string& content, const std::string& key, double& va
 {
     const std::string needle = "\"" + key + "\"";
     std::size_t pos = content.find(needle);
-    if (pos == std::string::npos)
+    if (pos == std::string::npos || (pos = content.find(':', pos + needle.size())) == std::string::npos)
     {
         return false;
     }
-    pos = content.find(':', pos + needle.size());
-    if (pos == std::string::npos)
+    for (++pos; pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos])); ++pos)
     {
-        return false;
-    }
-    pos++;
-    while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos])))
-    {
-        pos++;
     }
     std::size_t end = pos;
     while (end < content.size())
     {
         const char c = content[end];
-        if (!(std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '+' ||
-              c == '.' || c == 'e' || c == 'E'))
+        if (!(std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '+' || c == '.' ||
+              c == 'e' || c == 'E'))
         {
             break;
         }
-        end++;
+        ++end;
     }
     if (end == pos)
     {
@@ -1715,19 +1913,12 @@ ExtractJsonBool(const std::string& content, const std::string& key, bool& value)
 {
     const std::string needle = "\"" + key + "\"";
     std::size_t pos = content.find(needle);
-    if (pos == std::string::npos)
+    if (pos == std::string::npos || (pos = content.find(':', pos + needle.size())) == std::string::npos)
     {
         return false;
     }
-    pos = content.find(':', pos + needle.size());
-    if (pos == std::string::npos)
+    for (++pos; pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos])); ++pos)
     {
-        return false;
-    }
-    pos++;
-    while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos])))
-    {
-        pos++;
     }
     if (content.compare(pos, 4, "true") == 0)
     {
@@ -1742,13 +1933,39 @@ ExtractJsonBool(const std::string& content, const std::string& key, bool& value)
     return false;
 }
 
+static bool
+ExtractJsonString(const std::string& content, const std::string& key, std::string& value)
+{
+    const std::string needle = "\"" + key + "\"";
+    std::size_t pos = content.find(needle);
+    if (pos == std::string::npos || (pos = content.find(':', pos + needle.size())) == std::string::npos)
+    {
+        return false;
+    }
+    pos = content.find('"', pos + 1);
+    if (pos == std::string::npos)
+    {
+        return false;
+    }
+    const std::size_t end = content.find('"', pos + 1);
+    if (end == std::string::npos)
+    {
+        return false;
+    }
+    value = content.substr(pos + 1, end - pos - 1);
+    return true;
+}
+
 class DeepcFileBridge
 {
   public:
     void Configure(const std::string& bridgeDir,
                    uint32_t pastHorizon,
                    uint32_t futureHorizon,
-                   double timeoutS)
+                   double timeoutS,
+                   double minPowerDbm,
+                   double maxPowerDbm,
+                   double fixedBeaconIntervalS)
     {
         m_bridgeDir = bridgeDir;
         m_requestDir = m_bridgeDir / "requests";
@@ -1756,53 +1973,50 @@ class DeepcFileBridge
         m_pastHorizon = pastHorizon;
         m_futureHorizon = futureHorizon;
         m_timeoutS = timeoutS;
+        m_minPowerDbm = minPowerDbm;
+        m_maxPowerDbm = maxPowerDbm;
+        m_fixedBeaconIntervalS = fixedBeaconIntervalS;
 
         std::filesystem::create_directories(m_requestDir);
         std::filesystem::create_directories(m_responseDir);
 
-        m_appliedOut.open((m_bridgeDir / "applied_controls.csv").string().c_str(),
+        m_appliedOut.open((m_bridgeDir / "applied_controls.csv").string(),
                           std::ios::out | std::ios::trunc);
-        if (!m_appliedOut.is_open())
-        {
-            NS_FATAL_ERROR("Cannot open DeePC applied-controls log in " << m_bridgeDir);
-        }
-        m_appliedOut << "step,time_s,latest_sample_time_s,active_vehicle_count_core,"
-                     << "density_veh_per_km_core,tx_power_dbm,beacon_interval_s,"
-                     << "response_success,controller_solve_time_s,response_path\n";
-        m_appliedOut.flush();
+        NS_ABORT_MSG_IF(!m_appliedOut.is_open(),
+                        "Cannot open DeePC applied-controls log in " << m_bridgeDir);
+        m_appliedOut
+            << "step,time_s,latest_sample_time_s,active_vehicle_count_core,tx_power_dbm,"
+            << "beacon_interval_s,response_success,solver_status,controller_solve_time_s,"
+            << "objective,max_up_residual,max_yp_residual,predicted_prr,predicted_pir_s,"
+            << "predicted_cbr,response_path\n";
 
-        m_timingOut.open((m_bridgeDir / "controller_solve_times.csv").string().c_str(),
+        m_timingOut.open((m_bridgeDir / "controller_solve_times.csv").string(),
                          std::ios::out | std::ios::trunc);
-        if (!m_timingOut.is_open())
-        {
-            NS_FATAL_ERROR("Cannot open DeePC controller timing log in " << m_bridgeDir);
-        }
-        m_timingOut << "step,time_s,latest_sample_time_s,active_vehicle_count_core,"
-                    << "density_veh_per_km_core,wait_time_s,controller_solve_time_s,"
-                    << "response_success\n";
-        m_timingOut.flush();
+        NS_ABORT_MSG_IF(!m_timingOut.is_open(),
+                        "Cannot open DeePC timing log in " << m_bridgeDir);
+        m_timingOut << "step,time_s,latest_sample_time_s,active_vehicle_count_core,wait_time_s,"
+                    << "controller_solve_time_s,response_success\n";
     }
 
     bool PushSample(const KpiSample& sample)
     {
-        if (m_hasLastPushedSample && sample.timeS <= m_lastPushedSampleTimeS + 1e-9)
+        if (m_hasLastSample && sample.timeS <= m_lastSampleTimeS + 1e-9)
         {
             return false;
         }
-
         m_samples.push_back(sample);
         while (m_samples.size() > m_pastHorizon)
         {
             m_samples.pop_front();
         }
-        m_lastPushedSampleTimeS = sample.timeS;
-        m_hasLastPushedSample = true;
+        m_hasLastSample = true;
+        m_lastSampleTimeS = sample.timeS;
         return true;
     }
 
     bool Ready() const
     {
-        return m_samples.size() >= m_pastHorizon;
+        return m_samples.size() == m_pastHorizon;
     }
 
     std::size_t HistorySize() const
@@ -1815,103 +2029,75 @@ class DeepcFileBridge
         return m_pastHorizon;
     }
 
-    bool HasHistory() const
-    {
-        return !m_samples.empty();
-    }
-
-    const KpiSample& LatestSample() const
-    {
-        return m_samples.back();
-    }
-
     InputCommand RequestControl(uint32_t step, double timeS, const InputCommand& previousU)
     {
-        NS_ABORT_MSG_IF(!Ready(), "DeePC bridge requested control before history is ready");
-
+        NS_ABORT_MSG_IF(!Ready(), "DeePC control requested before history is ready");
         const auto requestPath = BuildStepPath(m_requestDir, "request", step);
         const auto responsePath = BuildStepPath(m_responseDir, "response", step);
         WriteRequest(requestPath, step, timeS, previousU);
 
-        std::cout << std::fixed << std::setprecision(3)
-                  << "DeePC request written step=" << step
-                  << " sim_time_s=" << timeS
-                  << " waiting_for=" << responsePath.string()
-                  << std::endl;
-
         const auto waitStart = std::chrono::steady_clock::now();
         while (!std::filesystem::exists(responsePath))
         {
-            const auto now = std::chrono::steady_clock::now();
-            const double elapsedS =
-                std::chrono::duration<double>(now - waitStart).count();
-            NS_ABORT_MSG_IF(elapsedS > m_timeoutS,
+            const double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - waitStart).count();
+            NS_ABORT_MSG_IF(elapsed > m_timeoutS,
                             "Timed out waiting for DeePC response: " << responsePath);
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        const double waitTimeS =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - waitStart).count();
 
-        const auto waitEnd = std::chrono::steady_clock::now();
-        const double waitTimeS = std::chrono::duration<double>(waitEnd - waitStart).count();
-
-        std::ifstream in(responsePath.string().c_str());
+        std::ifstream in(responsePath);
         NS_ABORT_MSG_IF(!in.is_open(), "Cannot open DeePC response: " << responsePath);
         std::stringstream buffer;
         buffer << in.rdbuf();
         const std::string content = buffer.str();
 
-        double txPower = previousU.txPowerDbm;
-        double beaconInterval = previousU.beaconIntervalS;
+        double candidatePower = previousU.txPowerDbm;
         double solveTimeS = 0.0;
-        bool success = true;
-        NS_ABORT_MSG_IF(!ExtractJsonNumber(content, "tx_power_dbm", txPower),
-                        "DeePC response missing tx_power_dbm: " << responsePath);
-        NS_ABORT_MSG_IF(!ExtractJsonNumber(content, "beacon_interval_s", beaconInterval),
-                        "DeePC response missing beacon_interval_s: " << responsePath);
+        double objective = std::numeric_limits<double>::quiet_NaN();
+        double maxUpResidual = std::numeric_limits<double>::infinity();
+        double maxYpResidual = std::numeric_limits<double>::infinity();
+        double predictedPrr = std::numeric_limits<double>::quiet_NaN();
+        double predictedPir = std::numeric_limits<double>::quiet_NaN();
+        double predictedCbr = std::numeric_limits<double>::quiet_NaN();
+        bool success = false;
+        std::string solverStatus = "missing";
+        const bool hasPower = ExtractJsonNumber(content, "tx_power_dbm", candidatePower);
         ExtractJsonNumber(content, "solve_time_s", solveTimeS);
+        ExtractJsonNumber(content, "objective", objective);
+        ExtractJsonNumber(content, "max_up_residual", maxUpResidual);
+        ExtractJsonNumber(content, "max_yp_residual", maxYpResidual);
+        ExtractJsonNumber(content, "predicted_prr", predictedPrr);
+        ExtractJsonNumber(content, "predicted_pir_s", predictedPir);
+        ExtractJsonNumber(content, "predicted_cbr", predictedCbr);
         ExtractJsonBool(content, "success", success);
+        ExtractJsonString(content, "solver_status", solverStatus);
+
+        success = success && hasPower && std::isfinite(candidatePower) &&
+                  candidatePower >= m_minPowerDbm - 1e-9 &&
+                  candidatePower <= m_maxPowerDbm + 1e-9;
+        const double appliedPower = success ? candidatePower : previousU.txPowerDbm;
+        const KpiSample& latest = m_samples.back();
+
+        m_appliedOut << std::fixed << std::setprecision(6) << step << "," << timeS << ","
+                     << latest.timeS << "," << latest.activeVehicleCountCore << ","
+                     << appliedPower << "," << m_fixedBeaconIntervalS << "," << (success ? 1 : 0)
+                     << "," << solverStatus << "," << solveTimeS << "," << objective << ","
+                     << maxUpResidual << "," << maxYpResidual << "," << predictedPrr << ","
+                     << predictedPir << "," << predictedCbr << "," << responsePath.string() << "\n";
+        m_appliedOut.flush();
+
+        m_timingOut << std::fixed << std::setprecision(6) << step << "," << timeS << ","
+                    << latest.timeS << "," << latest.activeVehicleCountCore << "," << waitTimeS
+                    << "," << solveTimeS << "," << (success ? 1 : 0) << "\n";
+        m_timingOut.flush();
 
         InputCommand command;
         command.timeS = timeS;
-        command.txPowerDbm = txPower;
-        command.beaconIntervalS = beaconInterval;
-
-        const KpiSample& latestSample = m_samples.back();
-
-        m_appliedOut << std::fixed << std::setprecision(6)
-                     << step << ","
-                     << timeS << ","
-                     << latestSample.timeS << ","
-                     << latestSample.activeVehicleCountCore << ","
-                     << latestSample.densityVehPerKmCore << ","
-                     << command.txPowerDbm << ","
-                     << command.beaconIntervalS << ","
-                     << (success ? 1 : 0) << ","
-                     << solveTimeS << ","
-                     << responsePath.string() << "\n";
-        m_appliedOut.flush();
-
-        m_timingOut << std::fixed << std::setprecision(6)
-                    << step << ","
-                    << timeS << ","
-                    << latestSample.timeS << ","
-                    << latestSample.activeVehicleCountCore << ","
-                    << latestSample.densityVehPerKmCore << ","
-                    << waitTimeS << ","
-                    << solveTimeS << ","
-                    << (success ? 1 : 0) << "\n";
-        m_timingOut.flush();
-
-        std::cout << std::fixed << std::setprecision(3)
-                  << "DeePC iteration step=" << step
-                  << " sim_time_done_s=" << timeS
-                  << " latest_sample_time_s=" << latestSample.timeS
-                  << " active_vehicles_core=" << latestSample.activeVehicleCountCore
-                  << " density_veh_per_km_core=" << latestSample.densityVehPerKmCore
-                  << " wait_s=" << waitTimeS
-                  << " solve_s=" << solveTimeS
-                  << " success=" << (success ? 1 : 0)
-                  << std::endl;
-
+        command.txPowerDbm = appliedPower;
+        command.beaconIntervalS = m_fixedBeaconIntervalS;
         return command;
     }
 
@@ -1928,11 +2114,10 @@ class DeepcFileBridge
     std::vector<double> BuildUIni() const
     {
         std::vector<double> values;
-        values.reserve(m_samples.size() * 2);
-        for (const auto& s : m_samples)
+        values.reserve(m_samples.size());
+        for (const auto& sample : m_samples)
         {
-            values.push_back(s.txPowerDbm);
-            values.push_back(s.beaconIntervalS);
+            values.push_back(sample.txPowerDbm);
         }
         return values;
     }
@@ -1941,45 +2126,13 @@ class DeepcFileBridge
     {
         std::vector<double> values;
         values.reserve(m_samples.size() * 3);
-        for (const auto& s : m_samples)
+        for (const auto& sample : m_samples)
         {
-            values.push_back(s.prrAwareness);
-            values.push_back(s.pirS);
-            values.push_back(s.cbr);
+            values.push_back(sample.prrAwareness);
+            values.push_back(sample.pirS);
+            values.push_back(sample.cbr);
         }
         return values;
-    }
-
-    std::vector<double> BuildDIni() const
-    {
-        std::vector<double> values;
-        values.reserve(m_samples.size() * 5);
-        for (const auto& s : m_samples)
-        {
-            AppendContext(values, s);
-        }
-        return values;
-    }
-
-    std::vector<double> BuildDFuture() const
-    {
-        std::vector<double> values;
-        values.reserve(m_futureHorizon * 5);
-        const KpiSample& latest = m_samples.back();
-        for (uint32_t i = 0; i < m_futureHorizon; ++i)
-        {
-            AppendContext(values, latest);
-        }
-        return values;
-    }
-
-    static void AppendContext(std::vector<double>& values, const KpiSample& s)
-    {
-        values.push_back(s.activeVehicleCountCore);
-        values.push_back(s.densityVehPerKmCore);
-        values.push_back(s.meanNeighbors150m);
-        values.push_back(s.meanNeighbors300m);
-        values.push_back(s.sensingExclusionRatio);
     }
 
     void WriteRequest(const std::filesystem::path& requestPath,
@@ -1987,38 +2140,27 @@ class DeepcFileBridge
                       double timeS,
                       const InputCommand& previousU) const
     {
-        const auto tmpPath = requestPath.string() + ".tmp";
-        std::ofstream out(tmpPath.c_str(), std::ios::out | std::ios::trunc);
+        const std::filesystem::path tmpPath = requestPath.string() + ".tmp";
+        std::ofstream out(tmpPath);
         NS_ABORT_MSG_IF(!out.is_open(), "Cannot write DeePC request: " << tmpPath);
-
-        out << "{\n";
-        out << "  \"step\": " << step << ",\n";
-        out << "  \"time_s\": " << std::setprecision(12) << timeS << ",\n";
-        out << "  \"past_horizon\": " << m_pastHorizon << ",\n";
-        out << "  \"future_horizon\": " << m_futureHorizon << ",\n";
-        out << "  \"input_cols\": [\"tx_power_dbm\", \"beacon_interval_s\"],\n";
-        out << "  \"output_cols\": [\"prr_awareness\", \"pir_s\", \"cbr\"],\n";
-        out << "  \"context_cols\": [\"active_vehicle_count_core\", "
-            << "\"density_veh_per_km_core\", \"mean_neighbors_150m\", "
-            << "\"mean_neighbors_300m\", \"sensing_exclusion_ratio\"],\n";
-        out << "  \"previous_u\": ";
-        WriteJsonArray(out, {previousU.txPowerDbm, previousU.beaconIntervalS});
-        out << ",\n";
-        out << "  \"u_ini\": ";
+        out << "{\n"
+            << "  \"step\": " << step << ",\n"
+            << "  \"time_s\": " << std::setprecision(12) << timeS << ",\n"
+            << "  \"past_horizon\": " << m_pastHorizon << ",\n"
+            << "  \"future_horizon\": " << m_futureHorizon << ",\n"
+            << "  \"fixed_beacon_interval_s\": " << m_fixedBeaconIntervalS << ",\n"
+            << "  \"active_vehicle_count_core\": " << m_samples.back().activeVehicleCountCore
+            << ",\n"
+            << "  \"input_cols\": [\"tx_power_dbm\"],\n"
+            << "  \"output_cols\": [\"prr_awareness\", \"pir_s\", \"cbr\"],\n"
+            << "  \"previous_u\": ";
+        WriteJsonArray(out, {previousU.txPowerDbm});
+        out << ",\n  \"u_ini\": ";
         WriteJsonArray(out, BuildUIni());
-        out << ",\n";
-        out << "  \"y_ini\": ";
+        out << ",\n  \"y_ini\": ";
         WriteJsonArray(out, BuildYIni());
-        out << ",\n";
-        out << "  \"d_ini\": ";
-        WriteJsonArray(out, BuildDIni());
-        out << ",\n";
-        out << "  \"d_future\": ";
-        WriteJsonArray(out, BuildDFuture());
-        out << "\n";
-        out << "}\n";
+        out << "\n}\n";
         out.close();
-
         std::filesystem::rename(tmpPath, requestPath);
     }
 
@@ -2027,10 +2169,13 @@ class DeepcFileBridge
     std::filesystem::path m_responseDir;
     uint32_t m_pastHorizon = 20;
     uint32_t m_futureHorizon = 10;
-    double m_timeoutS = 30.0;
+    double m_timeoutS = 900.0;
+    double m_minPowerDbm = 10.0;
+    double m_maxPowerDbm = 23.0;
+    double m_fixedBeaconIntervalS = 0.1;
     std::deque<KpiSample> m_samples;
-    bool m_hasLastPushedSample = false;
-    double m_lastPushedSampleTimeS = -1.0;
+    bool m_hasLastSample = false;
+    double m_lastSampleTimeS = -1.0;
     std::ofstream m_appliedOut;
     std::ofstream m_timingOut;
 };
@@ -2040,51 +2185,54 @@ RunDeepcBridgeStep(Ptr<KpiLogger> logger,
                    NetDeviceContainer ueDevs,
                    std::shared_ptr<DeepcFileBridge> bridge,
                    double evalStartS,
+                   double evalEndS,
                    double controlIntervalS,
+                   double fixedBeaconIntervalS,
                    InputCommand previousU,
                    uint32_t step)
 {
     const double now = Simulator::Now().GetSeconds();
-    bool pushedNewSample = false;
+    if (now > evalEndS + 1e-9)
+    {
+        return;
+    }
+
+    bool pushed = false;
     if (logger->HasLatestSample())
     {
         const KpiSample sample = logger->GetLatestSample();
-        if (sample.timeS + 1e-9 >= evalStartS)
+        if (sample.timeS + 1e-9 >= evalStartS && sample.timeS <= evalEndS + 1e-9)
         {
-            pushedNewSample = bridge->PushSample(sample);
+            pushed = bridge->PushSample(sample);
         }
     }
 
-    std::cout << std::fixed << std::setprecision(3)
-              << "DeePC bridge tick step=" << step
-              << " sim_time_s=" << now
-              << " history=" << bridge->HistorySize() << "/" << bridge->PastHorizon()
-              << " new_sample=" << (pushedNewSample ? 1 : 0);
-    if (bridge->HasHistory())
-    {
-        const KpiSample& latestSample = bridge->LatestSample();
-        std::cout << " latest_sample_time_s=" << latestSample.timeS
-                  << " active_vehicles_core=" << latestSample.activeVehicleCountCore
-                  << " density_veh_per_km_core=" << latestSample.densityVehPerKmCore;
-    }
-    std::cout << std::endl;
-
     InputCommand nextU = previousU;
-    if (bridge->Ready() && pushedNewSample)
+    uint32_t nextStep = step;
+    if (pushed && bridge->Ready())
     {
         nextU = bridge->RequestControl(step, now, previousU);
-        ApplyInputsAtTime(logger, ueDevs, nextU.txPowerDbm, nextU.beaconIntervalS);
+        ApplyTxPowerAtTime(logger,
+                           ueDevs,
+                           nextU.txPowerDbm,
+                           fixedBeaconIntervalS);
+        nextStep++;
     }
 
-    Simulator::Schedule(Seconds(controlIntervalS),
-                        &RunDeepcBridgeStep,
-                        logger,
-                        ueDevs,
-                        bridge,
-                        evalStartS,
-                        controlIntervalS,
-                        nextU,
-                        step + 1);
+    if (now + controlIntervalS <= evalEndS + 1e-9)
+    {
+        Simulator::Schedule(Seconds(controlIntervalS),
+                            &RunDeepcBridgeStep,
+                            logger,
+                            ueDevs,
+                            bridge,
+                            evalStartS,
+                            evalEndS,
+                            controlIntervalS,
+                            fixedBeaconIntervalS,
+                            nextU,
+                            nextStep);
+    }
 }
 
 static void
@@ -2106,7 +2254,6 @@ WriteMetadataJson(const std::string& kpiCsv,
                   double coreGuardBandM,
                   double coreMin,
                   double coreMax,
-                  double densityLengthM,
                   double awarenessRangeM,
                   uint32_t maxCamSizeBytes,
                   bool useInputSchedule,
@@ -2124,9 +2271,20 @@ WriteMetadataJson(const std::string& kpiCsv,
                   uint16_t t1,
                   uint16_t t2,
                   int slThresPsschRsrp,
-                  uint32_t vehicleCount,
+                  uint32_t logicalVehicleCount,
+                  uint32_t physicalVehicleCount,
+                  bool dynamicActivePool,
+                  uint32_t physicalUePoolSize,
+                  uint32_t peakActiveVehicles,
+                  uint32_t peakCoreVehicles,
                   uint32_t seed,
-                  uint32_t run)
+                  uint32_t run,
+                  const std::string& deepcBridgeDir,
+                  double deepcControlIntervalS,
+                  uint32_t deepcPastHorizon,
+                  uint32_t deepcFutureHorizon,
+                  double minTxPowerDbm,
+                  double maxTxPowerDbm)
 {
     const std::string metadataPath = DeriveSidecarPath(kpiCsv, "_metadata.json");
     std::ofstream out(metadataPath.c_str(), std::ios::out | std::ios::trunc);
@@ -2156,7 +2314,6 @@ WriteMetadataJson(const std::string& kpiCsv,
         << "  \"core_guard_band_m\": " << coreGuardBandM << ",\n"
         << "  \"core_min_m\": " << coreMin << ",\n"
         << "  \"core_max_m\": " << coreMax << ",\n"
-        << "  \"density_length_m\": " << densityLengthM << ",\n"
         << "  \"awareness_range_m\": " << awarenessRangeM << ",\n"
         << "  \"max_cam_encoded_size_bytes\": " << maxCamSizeBytes << ",\n"
         << "  \"cam_payload_format\": \"ETSI CAM ASN.1 UPER encoded payload with "
@@ -2184,32 +2341,38 @@ WriteMetadataJson(const std::string& kpiCsv,
         << "  \"t1_slots\": " << t1 << ",\n"
         << "  \"t2_slots\": " << t2 << ",\n"
         << "  \"sl_thres_pssch_rsrp_dbm\": " << slThresPsschRsrp << ",\n"
-        << "  \"vehicle_count\": " << vehicleCount << ",\n"
+        << "  \"logical_vehicle_count\": " << logicalVehicleCount << ",\n"
+        << "  \"physical_ue_count\": " << physicalVehicleCount << ",\n"
+        << "  \"dynamic_active_pool\": " << dynamicActivePool << ",\n"
+        << "  \"physical_ue_pool_size\": " << physicalUePoolSize << ",\n"
+        << "  \"peak_simultaneous_active_vehicles\": " << peakActiveVehicles << ",\n"
+        << "  \"peak_active_core_vehicles\": " << peakCoreVehicles << ",\n"
         << "  \"seed\": " << seed << ",\n"
         << "  \"run\": " << run << ",\n"
+        << "  \"controller_type\": \"Python CVXPY/OSQP Tx-power-only DeePC\",\n"
+        << "  \"deepc_bridge_dir\": \"" << JsonEscape(deepcBridgeDir) << "\",\n"
+        << "  \"deepc_control_interval_s\": " << deepcControlIntervalS << ",\n"
+        << "  \"deepc_past_horizon_samples\": " << deepcPastHorizon << ",\n"
+        << "  \"deepc_future_horizon_samples\": " << deepcFutureHorizon << ",\n"
+        << "  \"deepc_min_tx_power_dbm\": " << minTxPowerDbm << ",\n"
+        << "  \"deepc_max_tx_power_dbm\": " << maxTxPowerDbm << ",\n"
+        << "  \"deepc_controlled_inputs\": [\"tx_power_dbm\"],\n"
         << "  \"prr_definition\": \"unique successful Tx-Rx-seq receptions with TX-time distance <= "
            "awareness_range_m divided by TX-time eligible receiver opportunities; TX and RX "
            "events are filtered to the evaluation time window and core corridor region when enabled\",\n"
         << "  \"traffic_context_definition\": \"time-varying measured context sampled at the KPI "
-           "timestamp: active_vehicle_count_core is the number of evaluated vehicles inside the "
-           "core region, density_veh_per_km_core divides that count by density_length_m, and "
-           "mean_neighbors_150m/300m are per-vehicle instantaneous neighbor counts among active "
-           "core vehicles using 2D Euclidean distance\",\n"
+           "timestamp: active_vehicle_count_core is the number of evaluated vehicles active and "
+           "inside the core region\",\n"
         << "  \"cbr_definition\": \"PHY busy-time fraction over the 1.0 s window from "
            "NrSpectrumPhy::ChannelOccupied, averaged over evaluated UE nodes; evaluated nodes "
            "with no busy interval in the window contribute zero busy time\",\n"
         << "  \"cbr_primary_source\": \"NrSpectrumPhy::ChannelOccupied busy-time trace\",\n"
-        << "  \"sensing_exclusion_ratio_definition\": \"N_excluded_candidate_resources / "
-           "N_initial_candidate_resources over the 1.0 s window from "
-           "NrSlUeMac::SensingAlgorithm; this is a resource-selection diagnostic and is not "
-           "used as CBR\",\n"
         << "  \"cbr_alignment_method\": \"CBR and PRR/PIR are sampled by the simulator at the same "
-           "0.1 s timestamps; no interpolation is applied\",\n"
+        << sampleTimeS << " s timestamps; no interpolation is applied\",\n"
         << "  \"deepc_dataset_columns\": "
            "\"time_s,tx_power_dbm,beacon_interval_s,active_vehicle_count_core,"
-           "density_veh_per_km_core,mean_neighbors_150m,mean_neighbors_300m,"
-           "prr_awareness,pir_s,cbr,sensing_exclusion_ratio\",\n"
-        << "  \"distance_bins_m\": [0, 50, 100, 150, 200, 300]\n"
+           "tx_count,eligible_count,success_count,mean_eligible_per_tx,"
+           "mean_success_per_tx,prr_awareness,pir_s,pir_count,cbr\"\n"
         << "}\n";
 }
 
@@ -2224,8 +2387,9 @@ main(int argc, char* argv[])
     // File paths
     std::string mobilityCsv = "data/processed/ngsim_us101_mainline_active20_250_densest_600s.csv";
     std::string inputCsv = "data/processed/prbs_schedule.csv";
-    std::string kpiCsv = "data/output/deepc_closed_loop_250veh/kpi_timeseries.csv";
-    std::string cbrCsv = "data/output/deepc_closed_loop_250veh/cbr_timeseries.csv";
+    std::string kpiCsv = "data/output/deepc_closed_loop_txpower/kpi_timeseries.csv";
+    std::string cbrCsv = "data/output/deepc_closed_loop_txpower/cbr_timeseries.csv";
+    std::string deepcBridgeDir = "data/output/deepc_closed_loop_txpower/bridge";
 
     // Simulation time
     double simTimeSeconds = 300.0;
@@ -2235,17 +2399,16 @@ main(int argc, char* argv[])
     uint32_t run = 1;
 
     // Traffic / app
-    bool useIPv6 = false;
     uint32_t maxCamSizeBytes = 300;
     uint16_t port = 8000;
     bool useInputSchedule = false;
-    bool etsiCamGeneration = true;
+    bool etsiCamGeneration = false;
     double fixedBeaconIntervalS = 0.1;
 
     // SL bearer activation
     Time slBearersActivationTime = Seconds(2.0);
     Time camApplicationStartDelay = MilliSeconds(200);
-    bool harqEnabled = true;
+    bool harqEnabled = false;
     Time delayBudget = Seconds(0);
 
     // NR-V2X radio baseline
@@ -2256,8 +2419,8 @@ main(int argc, char* argv[])
     std::string slBitMap = "1|1|1|1|1|1|0|0|0|1|1|1";
     uint16_t numerologyBwpSl = 0;
     uint16_t slSensingWindow = 100;
-    uint16_t slSelectionWindow = 5;
-    uint16_t slSubchannelSize = 50;
+    uint16_t slSelectionWindow = 20; // 5 default
+    uint16_t slSubchannelSize = 20; //50 default
     uint16_t slMaxNumPerReserve = 3;
     double slProbResourceKeep = 0.0;
     uint16_t slMaxTxTransNumPssch = 5;
@@ -2269,10 +2432,12 @@ main(int argc, char* argv[])
     bool enableChannelRandomness = true;
     uint16_t channelUpdatePeriod = 500;
     uint16_t mcs = 6;
-    double awarenessRangeM = 300.0;
+    double awarenessRangeM = 200.0;
     double kpiWindowS = 1.0;
-    double sampleTimeS = 0.1; // 100 ms KPI sampling interval
-    uint32_t maxVehicles = 250; // 0 means all vehicles
+    double sampleTimeS = 0.5;
+    bool dynamicActivePool = true;
+    uint32_t physicalUePoolSize = kMaxPhysicalUePoolSize;
+    uint32_t maxVehicles = 0; // 0 means all logical vehicles
     bool enableCoreFilter = true;
     std::string coreAxis = "auto";
     double coreGuardBandM = 120.0;
@@ -2280,13 +2445,13 @@ main(int argc, char* argv[])
     double coreMax = std::numeric_limits<double>::quiet_NaN();
     bool requireFullDataCoverage = true;
     bool validateOnly = false;
-    bool allowProtectedOutput = false;
     bool enableDeepcBridge = true;
-    std::string deepcBridgeDir = "data/output/deepc_matlab_bridge_run01/bridge";
     double deepcControlIntervalS = 0.5;
-    uint32_t deepcPastHorizon = 3;
-    uint32_t deepcFutureHorizon = 2;
+    uint32_t deepcPastHorizon = 20;
+    uint32_t deepcFutureHorizon = 10;
     double deepcResponseTimeoutS = 900.0;
+    double minTxPowerDbm = 10.0;
+    double maxTxPowerDbm = 23.0;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("mobilityCsv", "Processed NGSIM mobility CSV", mobilityCsv);
@@ -2307,11 +2472,28 @@ main(int argc, char* argv[])
     cmd.AddValue("mcs", "Fixed sidelink MCS", mcs);
     cmd.AddValue("txPower", "Baseline Tx power [dBm]", txPower);
     cmd.AddValue("enableSensing", "Enable NR sidelink sensing-based resource selection", enableSensing);
+    cmd.AddValue("slSubchannelSize", "Sidelink subchannel size [RBs]", slSubchannelSize);
+    cmd.AddValue("slSelectionWindow", "Sidelink selection window [slots]; allowed values: 1, 5, 10, 20", slSelectionWindow);
+    cmd.AddValue("slProbResourceKeep", "Sidelink probability of keeping a selected resource", slProbResourceKeep);
+    cmd.AddValue("harqEnabled", "Enable sidelink HARQ", harqEnabled);
+    cmd.AddValue("slMaxTxTransNumPssch", "Maximum number of PSSCH transmissions", slMaxTxTransNumPssch);
+    cmd.AddValue("reservationPeriod", "Sidelink reservation period [ms]", reservationPeriod);
+    cmd.AddValue("t1", "Sidelink sensing T1 [slots]", t1);
+    cmd.AddValue("t2", "Sidelink sensing T2 [slots]", t2);
+    cmd.AddValue("slThresPsschRsrp", "Sidelink PSSCH RSRP threshold [dBm]", slThresPsschRsrp);
     cmd.AddValue("enableChannelRandomness", "Enable channel update randomness", enableChannelRandomness);
     cmd.AddValue("awarenessRange", "PRR awareness range [m]", awarenessRangeM);
     cmd.AddValue("kpiWindow", "KPI sliding window [s]", kpiWindowS);
     cmd.AddValue("sampleTime", "KPI output sample time [s]", sampleTimeS);
-    cmd.AddValue("maxVehicles", "Maximum number of vehicles to simulate; 0 means all vehicles", maxVehicles);
+    cmd.AddValue("dynamicActivePool",
+                 "Use a bounded physical UE pool assigned to active logical NGSIM vehicles",
+                 dynamicActivePool);
+    cmd.AddValue("physicalUePoolSize",
+                 "Maximum number of physical NR UEs when dynamicActivePool=true",
+                 physicalUePoolSize);
+    cmd.AddValue("maxVehicles",
+                 "Maximum number of logical NGSIM vehicles to load; 0 means all vehicles",
+                 maxVehicles);
     cmd.AddValue("enableCoreFilter", "Filter KPI evaluation to the central corridor core", enableCoreFilter);
     cmd.AddValue("coreAxis", "Longitudinal coordinate for core filter: auto, x, or y", coreAxis);
     cmd.AddValue("coreGuardBand", "Guard band removed from each corridor edge [m]", coreGuardBandM);
@@ -2323,69 +2505,43 @@ main(int argc, char* argv[])
     cmd.AddValue("validateOnly",
                  "Validate inputs and selected mobility coverage, then exit before building NR devices",
                  validateOnly);
-    cmd.AddValue("allowProtectedOutput",
-                 "Allow writing to protected original DeePC data paths; false prevents accidental overwrite",
-                 allowProtectedOutput);
-    cmd.AddValue("enableDeepcBridge",
-                 "Enable file-based closed-loop DeePC controller bridge",
-                 enableDeepcBridge);
-    cmd.AddValue("deepcBridgeDir",
-                 "Directory for DeePC request/response JSON files and bridge logs",
-                 deepcBridgeDir);
-    cmd.AddValue("deepcControlInterval",
-                 "Closed-loop DeePC control interval [s]",
-                 deepcControlIntervalS);
-    cmd.AddValue("deepcPastHorizon",
-                 "DeePC past horizon Tini in KPI samples",
-                 deepcPastHorizon);
-    cmd.AddValue("deepcFutureHorizon",
-                 "DeePC future horizon N in KPI samples",
-                 deepcFutureHorizon);
-    cmd.AddValue("deepcResponseTimeout",
-                 "Wall-clock timeout while waiting for DeePC response JSON [s]",
-                 deepcResponseTimeoutS);
+    cmd.AddValue("enableDeepcBridge", "Enable Python/OSQP DeePC file bridge", enableDeepcBridge);
+    cmd.AddValue("deepcBridgeDir", "Directory for DeePC request/response files", deepcBridgeDir);
+    cmd.AddValue("deepcControlInterval", "DeePC control interval [s]", deepcControlIntervalS);
+    cmd.AddValue("deepcPastHorizon", "DeePC past horizon Tini [samples]", deepcPastHorizon);
+    cmd.AddValue("deepcFutureHorizon", "DeePC prediction horizon N [samples]", deepcFutureHorizon);
+    cmd.AddValue("deepcResponseTimeout", "Controller response timeout [wall-clock s]", deepcResponseTimeoutS);
+    cmd.AddValue("minTxPower", "Minimum DeePC Tx power [dBm]", minTxPowerDbm);
+    cmd.AddValue("maxTxPower", "Maximum DeePC Tx power [dBm]", maxTxPowerDbm);
     cmd.Parse(argc, argv);
 
-    ValidateSafeOutputPaths(kpiCsv, cbrCsv, allowProtectedOutput);
-    std::cout << "Closed-loop DeePC scenario output guard = "
-              << (allowProtectedOutput ? "disabled (--allowProtectedOutput=true)"
-                                       : "enabled")
-              << std::endl;
-    std::cout << "KPI output CSV = " << kpiCsv << std::endl;
-    std::cout << "CBR output CSV = " << cbrCsv << std::endl;
-    std::cout << "Metadata JSON = " << DeriveSidecarPath(kpiCsv, "_metadata.json")
-              << std::endl;
-    if (enableDeepcBridge)
-    {
-        std::cout << "DeePC bridge enabled, directory = " << deepcBridgeDir << std::endl;
-    }
-
     NS_ABORT_MSG_IF(std::abs(kpiWindowS - 1.0) > 1e-9,
-                    "CBR sensing window is fixed by the experiment definition: kpiWindow must be 1.0 s");
-    NS_ABORT_MSG_IF(sampleTimeS <= 0.0,
-                    "sampleTime must be positive");
-    NS_ABORT_MSG_IF(!enableSensing,
-                    "CBR requires NR sidelink sensing. Run with --enableSensing=true.");
+                    "CBR window is fixed by the experiment definition: kpiWindow must be 1.0 s");
     NS_ABORT_MSG_IF(warmupS < 0.0 || cooldownS < 0.0,
                     "warmup and cooldown must be non-negative");
     NS_ABORT_MSG_IF(warmupS + cooldownS >= simTimeSeconds,
                     "warmup + cooldown must be smaller than simTime");
     NS_ABORT_MSG_IF(!enableDeepcBridge,
-                    "This scratch program is the closed-loop DeePC runner. "
-                    "Use --enableDeepcBridge=true, or use "
-                    "nr_v2x_ngsim_deepc_data_set_generation for PRBS/open-loop data.");
-    NS_ABORT_MSG_IF(enableDeepcBridge && useInputSchedule,
-                    "Closed-loop DeePC cannot run together with PRBS input schedule because "
-                    "PRBS would overwrite MATLAB DeePC actions. Use --useInputSchedule=false.");
-    NS_ABORT_MSG_IF(enableDeepcBridge && deepcPastHorizon == 0,
-                    "deepcPastHorizon must be positive");
-    NS_ABORT_MSG_IF(enableDeepcBridge && deepcFutureHorizon == 0,
-                    "deepcFutureHorizon must be positive");
-    NS_ABORT_MSG_IF(enableDeepcBridge && deepcResponseTimeoutS <= 0.0,
+                    "This executable is the closed-loop runner; enableDeepcBridge must be true");
+    NS_ABORT_MSG_IF(useInputSchedule,
+                    "Closed-loop DeePC requires useInputSchedule=false");
+    NS_ABORT_MSG_IF(etsiCamGeneration,
+                    "Tx-power DeePC requires fixed CAM generation: etsiCamGeneration=false");
+    NS_ABORT_MSG_IF(std::abs(fixedBeaconIntervalS - 0.1) > 1e-9,
+                    "Tx-power DeePC keeps fixedBeaconInterval at 0.1 s");
+    NS_ABORT_MSG_IF(std::abs(sampleTimeS - 0.5) > 1e-9 ||
+                        std::abs(deepcControlIntervalS - sampleTimeS) > 1e-9,
+                    "Training alignment requires sampleTime=deepcControlInterval=0.5 s");
+    NS_ABORT_MSG_IF(deepcPastHorizon != 20 || deepcFutureHorizon != 10,
+                    "This controller dataset requires Tini=20 and N=10");
+    NS_ABORT_MSG_IF(deepcResponseTimeoutS <= 0.0,
                     "deepcResponseTimeout must be positive");
-
+    NS_ABORT_MSG_IF(minTxPowerDbm >= maxTxPowerDbm ||
+                        txPower < minTxPowerDbm || txPower > maxTxPowerDbm,
+                    "Initial/minimum/maximum Tx power values are inconsistent");
     RngSeedManager::SetSeed(seed);
     RngSeedManager::SetRun(run);
+    g_dynamicActivePoolEnabled = dynamicActivePool;
 
     // Load data
     LoadMobilityCsv(mobilityCsv);
@@ -2407,9 +2563,6 @@ main(int argc, char* argv[])
     }
     NS_ABORT_MSG_IF(enableCoreFilter && coreMin >= coreMax,
                     "Invalid core region. Reduce coreGuardBand or set coreMin/coreMax.");
-
-    const double densityLengthM = enableCoreFilter ? (coreMax - coreMin) : (studyMax - studyMin);
-    NS_ABORT_MSG_IF(densityLengthM <= 0.0, "Density evaluation length must be positive");
 
     const double evalStartS = warmupS;
     const double evalEndS = simTimeSeconds - cooldownS;
@@ -2445,6 +2598,35 @@ main(int argc, char* argv[])
     {
         vehicleIds.resize(maxVehicles);
     }
+    const auto peakCounts = ComputePeakActiveCountsForVehicles(vehicleIds,
+                                                               enableCoreFilter,
+                                                               coreAxis,
+                                                               coreMin,
+                                                               coreMax);
+    const uint32_t peakActiveVehicles = peakCounts.first;
+    const uint32_t peakCoreVehicles = peakCounts.second;
+    const uint32_t physicalUeCount =
+        dynamicActivePool
+            ? std::min<uint32_t>(physicalUePoolSize, static_cast<uint32_t>(vehicleIds.size()))
+            : static_cast<uint32_t>(vehicleIds.size());
+    NS_ABORT_MSG_IF(vehicleIds.empty(), "No logical vehicles selected from mobility CSV");
+    NS_ABORT_MSG_IF(dynamicActivePool && physicalUePoolSize == 0,
+                    "physicalUePoolSize must be greater than zero when dynamicActivePool=true");
+    NS_ABORT_MSG_IF(dynamicActivePool && physicalUePoolSize > kMaxPhysicalUePoolSize,
+                    "physicalUePoolSize must be <= " << kMaxPhysicalUePoolSize
+                                                     << " for this experiment");
+    NS_ABORT_MSG_IF(dynamicActivePool && peakActiveVehicles > physicalUeCount,
+                    "Dynamic active pool exhausted by input data before simulation start: peak "
+                        << "simultaneous active vehicles = " << peakActiveVehicles
+                        << ", physical UE pool size = " << physicalUeCount
+                        << ". Increase --physicalUePoolSize.");
+
+    std::cout << "Logical NGSIM vehicles selected = " << vehicleIds.size() << std::endl;
+    std::cout << "Peak simultaneous active vehicles = " << peakActiveVehicles << std::endl;
+    std::cout << "Peak active core vehicles = " << peakCoreVehicles << std::endl;
+    std::cout << "Dynamic active pool = " << std::boolalpha << dynamicActivePool << std::endl;
+    std::cout << "Physical UEs to create = " << physicalUeCount << std::endl;
+
     ValidateTenMinuteDataCoverage(simTimeSeconds,
                                   evalStartS,
                                   evalEndS,
@@ -2466,25 +2648,42 @@ main(int argc, char* argv[])
         return 0;
     }
 
-    // Create nodes
+    // Create physical UE nodes and install either static per-vehicle mobility or reusable pool mobility.
     NodeContainer allSlUesContainer;
-    allSlUesContainer.Create(vehicleIds.size());
+    allSlUesContainer.Create(physicalUeCount);
 
-    for (uint32_t i = 0; i < vehicleIds.size(); ++i)
+    for (uint32_t i = 0; i < allSlUesContainer.GetN(); ++i)
     {
-        uint32_t vehicleId = vehicleIds[i];
         Ptr<Node> node = allSlUesContainer.Get(i);
-
-        g_vehicleIdToNodeId[vehicleId] = node->GetId();
-        g_nodeIdToVehicleId[node->GetId()] = vehicleId;
         g_nodeIdToNode[node->GetId()] = node;
-        g_nodeIdToActiveTimeRangeS[node->GetId()] =
-            ComputeMobilityTimeRange(g_mobilityByVehicle[vehicleId]);
 
-        InstallWaypointMobility(node, g_mobilityByVehicle[vehicleId]);
+        if (dynamicActivePool)
+        {
+            Ptr<NgsimPoolMobilityModel> mob = CreateObject<NgsimPoolMobilityModel>();
+            mob->SetParkingPosition(GetInactiveParkingPosition(node->GetId()));
+            node->AggregateObject(mob);
+            g_nodeIdToPoolMobility[node->GetId()] = mob;
+            g_freePoolNodeIds.push_back(node->GetId());
+        }
+        else
+        {
+            uint32_t vehicleId = vehicleIds[i];
+            g_vehicleIdToNodeId[vehicleId] = node->GetId();
+            g_nodeIdToVehicleId[node->GetId()] = vehicleId;
+            g_nodeIdToActiveTimeRangeS[node->GetId()] =
+                ComputeMobilityTimeRange(g_mobilityByVehicle[vehicleId]);
+
+            InstallWaypointMobility(node, g_mobilityByVehicle[vehicleId]);
+        }
+    }
+    if (dynamicActivePool)
+    {
+        AssignInitialDynamicPoolVehicles(vehicleIds, 0.0);
+        std::cout << "Initial active logical vehicles assigned = " << g_activeVehicleIds.size()
+                  << std::endl;
     }
 
-    std::cout << "Total UEs = " << allSlUesContainer.GetN() << std::endl;
+    std::cout << "Total physical UEs = " << allSlUesContainer.GetN() << std::endl;
 
     /**************** NR core + helper ****************/
     Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
@@ -2527,7 +2726,7 @@ main(int argc, char* argv[])
     nrHelper->SetUePhyAttribute("TxPower", DoubleValue(txPower));
 
     nrHelper->SetUeMacTypeId(NrSlUeMac::GetTypeId());
-    nrHelper->SetUeMacAttribute("EnableSensing", BooleanValue(true));
+    nrHelper->SetUeMacAttribute("EnableSensing", BooleanValue(enableSensing));
     nrHelper->SetUeMacAttribute("T1", UintegerValue(static_cast<uint8_t>(t1)));
     nrHelper->SetUeMacAttribute("T2", UintegerValue(t2));
     nrHelper->SetUeMacAttribute("ActivePoolId", UintegerValue(0));
@@ -2648,8 +2847,6 @@ main(int argc, char* argv[])
 
     uint32_t dstL2Id = 255;
     Ipv4Address groupAddress4("225.0.0.0");
-    Address remoteAddress;
-    Address localAddress;
 
     Ptr<LteSlTft> tft;
     SidelinkInfo slInfo;
@@ -2659,8 +2856,6 @@ main(int argc, char* argv[])
     slInfo.m_dynamic = false;
     slInfo.m_pdb = delayBudget;
     slInfo.m_harqEnabled = harqEnabled;
-
-    NS_ABORT_MSG_IF(useIPv6, "This merged file currently supports IPv4 only.");
 
     Ipv4InterfaceContainer ueIpIface = epcHelper->AssignUeIpv4Address(allSlUesNetDeviceContainer);
 
@@ -2673,9 +2868,6 @@ main(int argc, char* argv[])
         ueStaticRouting->SetDefaultRoute(epcHelper->GetUeDefaultGatewayAddress(), 1);
     }
 
-    remoteAddress = InetSocketAddress(groupAddress4, port);
-    localAddress = InetSocketAddress(Ipv4Address::GetAny(), port);
-
     tft = Create<LteSlTft>(LteSlTft::Direction::TRANSMIT, groupAddress4, slInfo);
     nrSlHelper->ActivateNrSlBearer(slBearersActivationTime, allSlUesNetDeviceContainer, tft);
 
@@ -2684,7 +2876,7 @@ main(int argc, char* argv[])
 
     /**************** KPI logger ****************/
     CbrLogger cbrLogger;
-    cbrLogger.Setup(1.0, 0.1, cbrCsv);
+    cbrLogger.Setup(kpiWindowS, sampleTimeS, cbrCsv);
     cbrLogger.SetEvaluationWindow(evalStartS, evalEndS);
     std::vector<uint32_t> evaluatedNodeIds;
     evaluatedNodeIds.reserve(allSlUesContainer.GetN());
@@ -2728,8 +2920,7 @@ main(int argc, char* argv[])
                       enableCoreFilter,
                       coreAxis,
                       coreMin,
-                      coreMax,
-                      densityLengthM);
+                      coreMax);
 
     for (uint32_t i = 0; i < allSlUesContainer.GetN(); ++i)
     {
@@ -2744,25 +2935,45 @@ main(int argc, char* argv[])
     for (uint32_t i = 0; i < allSlUesContainer.GetN(); ++i)
     {
         Ptr<Node> node = allSlUesContainer.Get(i);
-        Ipv4Address localAddr =
-            node->GetObject<Ipv4L3Protocol>()->GetAddress(1, 0).GetLocal();
 
         Ptr<CamApplication> app = CreateObject<CamApplication>();
-        app->Setup(node, logger, localAddr, groupAddress4, port, maxCamSizeBytes);
+        app->Setup(node, logger, groupAddress4, port);
         app->SetEtsiCamGeneration(etsiCamGeneration);
         app->SetBeaconInterval(fixedBeaconIntervalS);
         node->AddApplication(app);
-        const auto activeRange = g_nodeIdToActiveTimeRangeS[node->GetId()];
-        const double appStartS =
-            std::max((slBearersActivationTime + camApplicationStartDelay).GetSeconds(),
-                     activeRange.first);
-        const double appStopS = std::min(simTimeSeconds, activeRange.second);
-        if (appStopS > appStartS)
+
+        const uint32_t assignedVehicleId = ResolveVehicleIdForNode(node->GetId());
+        if (assignedVehicleId != kInvalidVehicleId)
         {
+            app->AssignVehicle(assignedVehicleId);
+        }
+
+        if (dynamicActivePool)
+        {
+            const double appStartS = (slBearersActivationTime + camApplicationStartDelay).GetSeconds();
             app->SetStartTime(Seconds(appStartS));
-            app->SetStopTime(Seconds(appStopS));
+            app->SetStopTime(Seconds(simTimeSeconds));
             g_apps[node->GetId()] = app;
         }
+        else
+        {
+            const auto activeRange = g_nodeIdToActiveTimeRangeS[node->GetId()];
+            const double appStartS =
+                std::max((slBearersActivationTime + camApplicationStartDelay).GetSeconds(),
+                         activeRange.first);
+            const double appStopS = std::min(simTimeSeconds, activeRange.second);
+            if (appStopS > appStartS)
+            {
+                app->SetStartTime(Seconds(appStartS));
+                app->SetStopTime(Seconds(appStopS));
+                g_apps[node->GetId()] = app;
+            }
+        }
+    }
+
+    if (dynamicActivePool)
+    {
+        ScheduleDynamicPoolAssignments(vehicleIds, 0.0, simTimeSeconds);
     }
 
     /**************** Time-varying input schedule ****************/
@@ -2774,29 +2985,31 @@ main(int argc, char* argv[])
     /**************** Periodic KPI sampling ****************/
     Simulator::Schedule(Seconds(sampleTimeS), &KpiLogger::SampleAndWrite, logger);
 
-    /**************** Optional file-based DeePC bridge ****************/
-    if (enableDeepcBridge)
-    {
-        auto deepcBridge = std::make_shared<DeepcFileBridge>();
-        deepcBridge->Configure(deepcBridgeDir,
-                               deepcPastHorizon,
-                               deepcFutureHorizon,
-                               deepcResponseTimeoutS);
-        InputCommand initialU;
-        initialU.timeS = evalStartS;
-        initialU.txPowerDbm = txPower;
-        initialU.beaconIntervalS = fixedBeaconIntervalS;
-        const double firstBridgeStepS = evalStartS + sampleTimeS;
-        Simulator::Schedule(Seconds(firstBridgeStepS),
-                            &RunDeepcBridgeStep,
-                            logger,
-                            allSlUesNetDeviceContainer,
-                            deepcBridge,
-                            evalStartS,
-                            deepcControlIntervalS,
-                            initialU,
-                            0);
-    }
+    /**************** Python/OSQP Tx-power DeePC bridge ****************/
+    auto deepcBridge = std::make_shared<DeepcFileBridge>();
+    deepcBridge->Configure(deepcBridgeDir,
+                           deepcPastHorizon,
+                           deepcFutureHorizon,
+                           deepcResponseTimeoutS,
+                           minTxPowerDbm,
+                           maxTxPowerDbm,
+                           fixedBeaconIntervalS);
+    InputCommand initialU;
+    initialU.timeS = evalStartS;
+    initialU.txPowerDbm = txPower;
+    initialU.beaconIntervalS = fixedBeaconIntervalS;
+    const double firstBridgeStepS = evalStartS + sampleTimeS + 1e-6;
+    Simulator::Schedule(Seconds(firstBridgeStepS),
+                        &RunDeepcBridgeStep,
+                        logger,
+                        allSlUesNetDeviceContainer,
+                        deepcBridge,
+                        evalStartS,
+                        evalEndS,
+                        deepcControlIntervalS,
+                        fixedBeaconIntervalS,
+                        initialU,
+                        0);
 
     WriteMetadataJson(kpiCsv,
                       cbrCsv,
@@ -2816,7 +3029,6 @@ main(int argc, char* argv[])
                       coreGuardBandM,
                       coreMin,
                       coreMax,
-                      densityLengthM,
                       awarenessRangeM,
                       maxCamSizeBytes,
                       useInputSchedule,
@@ -2834,9 +3046,20 @@ main(int argc, char* argv[])
                       t1,
                       t2,
                       slThresPsschRsrp,
+                      static_cast<uint32_t>(vehicleIds.size()),
                       allSlUesContainer.GetN(),
+                      dynamicActivePool,
+                      physicalUePoolSize,
+                      peakActiveVehicles,
+                      peakCoreVehicles,
                       seed,
-                      run);
+                      run,
+                      deepcBridgeDir,
+                      deepcControlIntervalS,
+                      deepcPastHorizon,
+                      deepcFutureHorizon,
+                      minTxPowerDbm,
+                      maxTxPowerDbm);
 
     /**************** Simulation ****************/
     Simulator::Stop(Seconds(simTimeSeconds));
