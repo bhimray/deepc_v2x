@@ -1987,8 +1987,8 @@ class DeepcFileBridge
         m_appliedOut
             << "step,time_s,latest_sample_time_s,active_vehicle_count_core,tx_power_dbm,"
             << "beacon_interval_s,response_success,solver_status,controller_solve_time_s,"
-            << "objective,max_up_residual,max_yp_residual,predicted_prr,predicted_pir_s,"
-            << "predicted_cbr,response_path\n";
+            << "objective,max_up_residual,max_yp_residual,max_dp_residual,max_df_residual,"
+            << "predicted_prr,predicted_pir_s,predicted_cbr,response_path\n";
 
         m_timingOut.open((m_bridgeDir / "controller_solve_times.csv").string(),
                          std::ios::out | std::ios::trunc);
@@ -2059,6 +2059,8 @@ class DeepcFileBridge
         double objective = std::numeric_limits<double>::quiet_NaN();
         double maxUpResidual = std::numeric_limits<double>::infinity();
         double maxYpResidual = std::numeric_limits<double>::infinity();
+        double maxDpResidual = 0.0;
+        double maxDfResidual = 0.0;
         double predictedPrr = std::numeric_limits<double>::quiet_NaN();
         double predictedPir = std::numeric_limits<double>::quiet_NaN();
         double predictedCbr = std::numeric_limits<double>::quiet_NaN();
@@ -2069,6 +2071,8 @@ class DeepcFileBridge
         ExtractJsonNumber(content, "objective", objective);
         ExtractJsonNumber(content, "max_up_residual", maxUpResidual);
         ExtractJsonNumber(content, "max_yp_residual", maxYpResidual);
+        ExtractJsonNumber(content, "max_dp_residual", maxDpResidual);
+        ExtractJsonNumber(content, "max_df_residual", maxDfResidual);
         ExtractJsonNumber(content, "predicted_prr", predictedPrr);
         ExtractJsonNumber(content, "predicted_pir_s", predictedPir);
         ExtractJsonNumber(content, "predicted_cbr", predictedCbr);
@@ -2085,8 +2089,9 @@ class DeepcFileBridge
                      << latest.timeS << "," << latest.activeVehicleCountCore << ","
                      << appliedPower << "," << m_fixedBeaconIntervalS << "," << (success ? 1 : 0)
                      << "," << solverStatus << "," << solveTimeS << "," << objective << ","
-                     << maxUpResidual << "," << maxYpResidual << "," << predictedPrr << ","
-                     << predictedPir << "," << predictedCbr << "," << responsePath.string() << "\n";
+                     << maxUpResidual << "," << maxYpResidual << "," << maxDpResidual << ","
+                     << maxDfResidual << "," << predictedPrr << "," << predictedPir << ","
+                     << predictedCbr << "," << responsePath.string() << "\n";
         m_appliedOut.flush();
 
         m_timingOut << std::fixed << std::setprecision(6) << step << "," << timeS << ","
@@ -2135,6 +2140,17 @@ class DeepcFileBridge
         return values;
     }
 
+    std::vector<double> BuildDIni() const
+    {
+        std::vector<double> values;
+        values.reserve(m_samples.size());
+        for (const auto& sample : m_samples)
+        {
+            values.push_back(sample.activeVehicleCountCore);
+        }
+        return values;
+    }
+
     void WriteRequest(const std::filesystem::path& requestPath,
                       uint32_t step,
                       double timeS,
@@ -2153,12 +2169,16 @@ class DeepcFileBridge
             << ",\n"
             << "  \"input_cols\": [\"tx_power_dbm\"],\n"
             << "  \"output_cols\": [\"prr_awareness\", \"pir_s\", \"cbr\"],\n"
+            << "  \"context_cols\": [\"active_vehicle_count_core\"],\n"
+            << "  \"density_forecast_mode\": \"hold_last\",\n"
             << "  \"previous_u\": ";
         WriteJsonArray(out, {previousU.txPowerDbm});
         out << ",\n  \"u_ini\": ";
         WriteJsonArray(out, BuildUIni());
         out << ",\n  \"y_ini\": ";
         WriteJsonArray(out, BuildYIni());
+        out << ",\n  \"d_ini\": ";
+        WriteJsonArray(out, BuildDIni());
         out << "\n}\n";
         out.close();
         std::filesystem::rename(tmpPath, requestPath);

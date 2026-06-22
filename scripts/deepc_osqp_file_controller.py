@@ -16,7 +16,7 @@ import numpy as np
 
 INPUT_COLS = ["tx_power_dbm"]
 OUTPUT_COLS = ["prr_awareness", "pir_s", "cbr"]
-
+CONTEXT_COLS = ["active_vehicle_count_core"]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -61,8 +61,12 @@ class TxPowerDeepc:
             raise ValueError(
                 f"Expected output columns {OUTPUT_COLS}, got {self.summary['output_cols']}"
             )
-        if self.summary.get("context_cols"):
-            raise ValueError("The Tx-power controller dataset must exclude context columns")
+        self.context_cols = list(self.summary.get("context_cols") or [])
+        if self.context_cols not in ([], CONTEXT_COLS):
+            raise ValueError(
+                f"Expected no context columns or {CONTEXT_COLS}, got {self.context_cols}"
+            )
+        self.use_context = self.context_cols == CONTEXT_COLS
         if self.summary["past_horizon_samples"] != 20:
             raise ValueError("Expected Tini=20")
         if self.summary["future_horizon_samples"] != 10:
@@ -72,6 +76,8 @@ class TxPowerDeepc:
         self.uf = hankel["u_f"]
         self.yp = hankel["y_p"]
         self.yf = hankel["y_f"]
+        self.dp = hankel["d_p"] if self.use_context else None
+        self.df = hankel["d_f"] if self.use_context else None
         expected = {
             "Up": (20, 307),
             "Uf": (10, 307),
@@ -84,6 +90,11 @@ class TxPowerDeepc:
             "Yp": self.yp.shape,
             "Yf": self.yf.shape,
         }
+        if self.use_context:
+            expected["Dp"] = (20, 307)
+            expected["Df"] = (10, 307)
+            actual["Dp"] = self.dp.shape
+            actual["Df"] = self.df.shape
         if actual != expected:
             raise ValueError(f"Unexpected Hankel dimensions: expected {expected}, got {actual}")
 
@@ -92,11 +103,19 @@ class TxPowerDeepc:
         self.u_std = self.scaler["std"]["tx_power_dbm"]
         self.y_mean = np.array([self.scaler["mean"][name] for name in OUTPUT_COLS])
         self.y_std = np.array([self.scaler["std"][name] for name in OUTPUT_COLS])
+        if self.use_context:
+            self.d_mean = self.scaler["mean"]["active_vehicle_count_core"]
+            self.d_std = self.scaler["std"]["active_vehicle_count_core"]
+        else:
+            self.d_mean = 0.0
+            self.d_std = 1.0
 
         n_columns = self.up.shape[1]
         self.g = cp.Variable(n_columns)
         self.u_ini = cp.Parameter(self.up.shape[0])
         self.y_ini = cp.Parameter(self.yp.shape[0])
+        self.d_ini = cp.Parameter(self.dp.shape[0]) if self.use_context else None
+        self.d_future = cp.Parameter(self.df.shape[0]) if self.use_context else None
         self.y_ref = cp.Parameter(self.yf.shape[0])
         future_u = self.uf @ self.g
         future_y = self.yf @ self.g
@@ -116,6 +135,13 @@ class TxPowerDeepc:
             future_u >= min_power_norm,
             future_u <= max_power_norm,
         ]
+        if self.use_context:
+            constraints.extend(
+                [
+                    self.dp @ self.g == self.d_ini,
+                    self.df @ self.g == self.d_future,
+                ]
+            )
         self.problem = cp.Problem(cp.Minimize(objective), constraints)
         reference = np.array(
             [args.prr_reference, args.pir_reference, args.cbr_reference], dtype=float
@@ -136,6 +162,12 @@ class TxPowerDeepc:
         matrix = values.reshape(-1, 3)
         return matrix * self.y_std + self.y_mean
 
+    def normalize_d(self, values: np.ndarray) -> np.ndarray:
+        return (values - self.d_mean) / self.d_std
+
+    def denormalize_d(self, values: np.ndarray) -> np.ndarray:
+        return values * self.d_std + self.d_mean
+
     def solve(self, request: dict) -> dict:
         previous_power = float(request["previous_u"][0])
         start = time.perf_counter()
@@ -143,8 +175,11 @@ class TxPowerDeepc:
         objective = None
         max_up_residual = None
         max_yp_residual = None
+        max_dp_residual = None
+        max_df_residual = None
         future_power: list[float] = []
         future_y = np.empty((0, 3))
+        d_future_physical: list[float] = []
         error = None
 
         try:
@@ -156,6 +191,17 @@ class TxPowerDeepc:
             y_ini = np.asarray(request["y_ini"], dtype=float)
             if u_ini.shape != (20,) or y_ini.shape != (60,):
                 raise ValueError(f"Bad history shapes: u_ini={u_ini.shape}, y_ini={y_ini.shape}")
+            if self.use_context:
+                if request.get("context_cols") != CONTEXT_COLS:
+                    raise ValueError("Request context columns do not match the controller dataset")
+                if request.get("density_forecast_mode", "hold_last") != "hold_last":
+                    raise ValueError("Only density_forecast_mode=hold_last is supported")
+                d_ini = np.asarray(request["d_ini"], dtype=float)
+                if d_ini.shape != (20,):
+                    raise ValueError(f"Bad density history shape: d_ini={d_ini.shape}")
+                d_future_physical = np.full(10, d_ini[-1], dtype=float).tolist()
+                self.d_ini.value = self.normalize_d(d_ini)
+                self.d_future.value = self.normalize_d(np.asarray(d_future_physical, dtype=float))
 
             self.u_ini.value = self.normalize_u(u_ini)
             self.y_ini.value = self.normalize_y(y_ini)
@@ -179,6 +225,9 @@ class TxPowerDeepc:
             future_y = self.denormalize_y(future_y_norm)
             max_up_residual = float(np.max(np.abs(self.up @ g_value - self.u_ini.value)))
             max_yp_residual = float(np.max(np.abs(self.yp @ g_value - self.y_ini.value)))
+            if self.use_context:
+                max_dp_residual = float(np.max(np.abs(self.dp @ g_value - self.d_ini.value)))
+                max_df_residual = float(np.max(np.abs(self.df @ g_value - self.d_future.value)))
             objective = float(self.problem.value)
 
             if not np.isfinite(future_power_array).all() or not np.isfinite(future_y).all():
@@ -191,6 +240,13 @@ class TxPowerDeepc:
             if (
                 max_up_residual > self.args.residual_tolerance
                 or max_yp_residual > self.args.residual_tolerance
+                or (
+                    self.use_context
+                    and (
+                        max_dp_residual > self.args.residual_tolerance
+                        or max_df_residual > self.args.residual_tolerance
+                    )
+                )
             ):
                 raise RuntimeError("DeePC equality residual exceeds tolerance")
             future_power = future_power_array.tolist()
@@ -216,6 +272,10 @@ class TxPowerDeepc:
             "solve_time_s": solve_time,
             "max_up_residual": max_up_residual,
             "max_yp_residual": max_yp_residual,
+            "max_dp_residual": max_dp_residual,
+            "max_df_residual": max_df_residual,
+            "density_forecast_mode": "hold_last" if self.use_context else "none",
+            "density_forecast_active_vehicle_count_core": d_future_physical,
             "error": error,
         }
         return response
@@ -233,6 +293,9 @@ def open_logs(bridge_dir: Path) -> tuple[csv.DictWriter, object, csv.DictWriter,
         "solve_time_s",
         "max_up_residual",
         "max_yp_residual",
+        "max_dp_residual",
+        "max_df_residual",
+        "density_forecast_mode",
         "error",
     ]
     diagnostics = csv.DictWriter(diagnostic_file, fieldnames=diagnostic_fields)
@@ -248,6 +311,7 @@ def open_logs(bridge_dir: Path) -> tuple[csv.DictWriter, object, csv.DictWriter,
         "predicted_prr",
         "predicted_pir_s",
         "predicted_cbr",
+        "forecast_active_vehicle_count_core",
     ]
     predictions = csv.DictWriter(prediction_file, fieldnames=prediction_fields)
     predictions.writeheader()
@@ -265,7 +329,12 @@ def main() -> None:
     print(
         "Loaded Tx-power DeePC: "
         f"Up={controller.up.shape}, Uf={controller.uf.shape}, "
-        f"Yp={controller.yp.shape}, Yf={controller.yf.shape}",
+        f"Yp={controller.yp.shape}, Yf={controller.yf.shape}"
+        + (
+            f", Dp={controller.dp.shape}, Df={controller.df.shape}"
+            if controller.use_context
+            else ""
+        ),
         flush=True,
     )
 
@@ -304,6 +373,11 @@ def main() -> None:
                                 "predicted_prr": response["predicted_prr_horizon"][index],
                                 "predicted_pir_s": response["predicted_pir_s_horizon"][index],
                                 "predicted_cbr": response["predicted_cbr_horizon"][index],
+                                "forecast_active_vehicle_count_core": (
+                                    response["density_forecast_active_vehicle_count_core"][index]
+                                    if response["density_forecast_active_vehicle_count_core"]
+                                    else None
+                                ),
                             }
                         )
                     prediction_file.flush()

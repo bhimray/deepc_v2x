@@ -125,7 +125,7 @@ def metrics(
             }
         )
     if applied is not None and len(applied):
-        for column in ["max_up_residual", "max_yp_residual"]:
+        for column in ["max_up_residual", "max_yp_residual", "max_dp_residual", "max_df_residual"]:
             if column in applied:
                 result[column] = float(applied[column].max())
     if predictions is not None and len(predictions):
