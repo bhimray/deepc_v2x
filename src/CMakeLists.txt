@@ -15,41 +15,10 @@ foreach(libname ${libs})
     message(STATUS "Processing src/${libname}")
     add_subdirectory(${libname})
   else()
-    message(${HIGHLIGHTED_STATUS}
-            "Skipping src/${libname}: it does not contain a CMakeLists.txt file"
+    message(
+      ${HIGHLIGHTED_STATUS}
+      "Skipping src/${libname} : it does not contain a CMakeLists.txt file"
     )
-  endif()
-endforeach()
-
-# Scan for disabled modules that define settings prefixed with NS3_ or ENABLE_
-# so that we can initialize them as turned off (setting as temporary variables
-# not to affect the cached variables that are set when normally processed)
-subdirlist(modules ${CMAKE_CURRENT_SOURCE_DIR})
-foreach(libname ${modules})
-  if(NOT (${libname} IN_LIST libs))
-    # Skip module directories without CMakeLists.txt files
-    if(NOT (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${libname}/CMakeLists.txt))
-      continue()
-    endif()
-
-    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/${libname}/CMakeLists.txt
-         lib_cmakelists_contents
-    )
-    string(REGEX MATCHALL "(NS3_[a-zA-Z0-9_]*)|(ENABLE_[a-zA-Z0-9_]*)" flags
-                 "${lib_cmakelists_contents}"
-    )
-    foreach(flag ${flags})
-      # Skip reason flags
-      if(${flag} MATCHES "REASON")
-        continue()
-      endif()
-      # Skip flags already defined
-      if(DEFINED ${flag})
-        continue()
-      endif()
-      # Set flag to off
-      set(${flag} OFF PARENT_SCOPE)
-    endforeach()
   endif()
 endforeach()
 
@@ -89,26 +58,37 @@ if(${NS3_STATIC})
   endif()
 
   target_link_libraries(
-    ${lib-ns3-static} ${STATIC_LINK_FLAGS} ${LIB_AS_NEEDED_PRE_STATIC}
-    ${ns3-external-static-libs} ${LIB_AS_NEEDED_POST_STATIC}
+    ${lib-ns3-static}
+    -static
+    -static-libstdc++
+    -static-libgcc
+    ${LIB_AS_NEEDED_PRE_STATIC}
+    ${ns3-external-static-libs}
+    ${LIB_AS_NEEDED_POST_STATIC}
   )
   if(${NS3_CLANG_TIMETRACE})
     add_dependencies(timeTraceReport ${lib-ns3-static})
   endif()
 endif()
 
-# Build the lib-ns3 (ns3.x-monolib-buildtype.dll/.dylib/.so) with all
+# Build the lib-ns3-static (ns3.x-monolib-buildtype.dll/.dylib/.so) with all
 # sublibraries
 if(${NS3_MONOLIB})
   add_library(
     ${lib-ns3-monolib} SHARED ${PROJECT_SOURCE_DIR}/build-support/empty.cc
                               "${lib-ns3-static-objs}"
+          automotive/model/DCC/DCC.h
+          automotive/model/DCC/DCC.cc
+          automotive/model/LOS-NLOS/los_nlos.h
+          automotive/model/LOS-NLOS/los_nlos.cc
+          automotive/model/Foresee/foresee.h
+          automotive/model/Foresee/foresee.cc
+          automotive/model/Foresee/foresee.h
+          automotive/model/Foresee/trajectoryPrediction.cc
+          automotive/model/Foresee/trajectoryPrediction.h
   )
   set_target_properties(
-    ${lib-ns3-monolib}
-    PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE
-               RUNTIME_OUTPUT_DIRECTORY
-               ${CMAKE_LIBRARY_OUTPUT_DIRECTORY} # set output directory for DLLs
+    ${lib-ns3-monolib} PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE
   )
   target_link_libraries(
     ${lib-ns3-monolib} ${LIB_AS_NEEDED_PRE} ${ns3-external-libs}
@@ -117,8 +97,4 @@ if(${NS3_MONOLIB})
   if(${NS3_CLANG_TIMETRACE})
     add_dependencies(timeTraceReport ${lib-ns3-monolib})
   endif()
-endif()
-
-if(${NS3_FETCH_OPTIONAL_COMPONENTS})
-  add_dependency_to_optional_modules_dependencies()
 endif()

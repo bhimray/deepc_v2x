@@ -3578,6 +3578,23 @@ LteUeRrc::ActivateNrSlDrb(bool isTransmit, bool isReceive, const struct Sidelink
     // Associate this RRC entity's source L2 ID with the sidelink info that
     // was passed in (possibly with an uninitialized srcL2Id field)
     struct SidelinkInfo slInfoWithSrcId(slInfo);
+    if ((m_srcL2Id == 0 || m_srcL2Id == std::numeric_limits<uint32_t>::max()) &&
+        m_nrSlRrcSapUser != nullptr)
+    {
+        const uint32_t sapSourceL2Id = m_nrSlRrcSapUser->GetSourceL2Id();
+        if (sapSourceL2Id != 0 && sapSourceL2Id != std::numeric_limits<uint32_t>::max())
+        {
+            m_srcL2Id = sapSourceL2Id;
+        }
+    }
+    if (m_srcL2Id == 0 || m_srcL2Id == std::numeric_limits<uint32_t>::max())
+    {
+        m_srcL2Id = static_cast<uint32_t>(m_imsi & 0xFFFFFF);
+        if (m_srcL2Id == 0)
+        {
+            m_srcL2Id = 1;
+        }
+    }
     slInfoWithSrcId.m_srcL2Id = m_srcL2Id;
 
     switch (m_state)
@@ -3791,7 +3808,10 @@ LteUeRrc::AddNrSlRxDrb(uint32_t srcL2Id, uint32_t dstL2Id, uint8_t lcid)
     NS_LOG_FUNCTION(this << srcL2Id << dstL2Id << +lcid);
 
     NS_ABORT_MSG_IF((srcL2Id == 0 || dstL2Id == 0),
-                    "Layer 2 source or destination Id shouldn't be 0");
+                    "Layer 2 source or destination Id shouldn't be 0"
+                        << " (srcL2Id=" << srcL2Id << ", dstL2Id=" << dstL2Id
+                        << ", lcid=" << +lcid << ", imsi=" << m_imsi
+                        << ", rnti=" << m_rnti << ", rrcSrcL2Id=" << m_srcL2Id << ")");
 
     NrSlUeCmacSapProvider::SidelinkLogicalChannelInfo lcInfo;
     lcInfo.srcL2Id = srcL2Id;

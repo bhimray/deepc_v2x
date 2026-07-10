@@ -50,6 +50,31 @@ vcpkg/
 
 # Local/raw datasets
 data/raw/us101/us101_raw.csv
+data/output/
+data/processed/
+
+# Local Python environments
+v2x_env/
+
+# Local JavaScript dependencies
+node_modules/
+
+# Local Codex/IDE state
+.codex
+
+# Generated ns-3/V2X simulation artifacts
+*.db
+*.gif
+*.png
+deepc_dataset.csv
+Nr*Stats.txt
+mobility-*.txt
+init-pos-*.txt
+gnu-script-*.txt
+gif-script-*.txt
+
+# Local backup module copies
+src/*.bak/
 
 # Ignore local cache used by e.g. clangd
 .cache/

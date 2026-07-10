@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Plot ns-3/MATLAB DeePC bridge run results.
+
+Expected run folder contents:
+  kpi_timeseries.csv
+  applied_controls.csv or bridge/applied_controls.csv
+  controller_solve_times.csv or bridge/controller_solve_times.csv
+  bridge_requests/      optional
+  bridge_responses/     optional
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+TRAFFIC_CONTEXT_COLUMNS = [
+    ("density_veh_per_km_core", "Density veh/km", "mean_density_veh_per_km_core"),
+    ("active_vehicle_count_core", "Active core vehicles", "mean_active_vehicle_count_core"),
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Plot a DeePC bridge run folder.")
+    parser.add_argument("run_dir", nargs="?", type=Path, help="Run output directory.")
+    parser.add_argument(
+        "--campaign-dir",
+        type=Path,
+        default=None,
+        help="Campaign root containing 02_runs/<method>/run_<id>.",
+    )
+    parser.add_argument("--method", default=None, help="Method folder under 02_runs.")
+    parser.add_argument("--run", default=None, help="Run number, e.g., 101 or run_101.")
+    parser.add_argument("--out-dir", type=Path, default=None, help="Defaults to RUN_DIR/plots.")
+    return parser.parse_args()
+
+
+def normalize_run_name(run: str) -> str:
+    return run if run.startswith("run_") else f"run_{int(run):03d}"
+
+
+def resolve_run_dir(args: argparse.Namespace) -> Path:
+    if args.run_dir is not None:
+        return args.run_dir
+    if args.campaign_dir is None or args.method is None or args.run is None:
+        raise ValueError("Provide RUN_DIR, or provide --campaign-dir, --method, and --run.")
+    return args.campaign_dir / "02_runs" / args.method / normalize_run_name(str(args.run))
+
+
+def load_optional_csv(paths: list[Path]) -> pd.DataFrame | None:
+    for path in paths:
+        if path.exists():
+            try:
+                return pd.read_csv(path)
+            except pd.errors.EmptyDataError:
+                continue
+    return None
+
+
+def add_prr_alias(kpi: pd.DataFrame) -> pd.DataFrame:
+    if "prr_awareness" not in kpi and "prr_150m" in kpi:
+        kpi = kpi.copy()
+        kpi["prr_awareness"] = kpi["prr_150m"]
+    return kpi
+
+
+def require_columns(df: pd.DataFrame, path: Path, columns: list[str]) -> None:
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {', '.join(missing)}")
+
+
+def traffic_context_column(kpi: pd.DataFrame) -> tuple[str, str, str] | None:
+    for column, ylabel, metric_name in TRAFFIC_CONTEXT_COLUMNS:
+        if column in kpi:
+            return column, ylabel, metric_name
+    return None
+
+
+def metrics(
+    kpi: pd.DataFrame,
+    applied: pd.DataFrame | None,
+    timing: pd.DataFrame | None,
+    predictions: pd.DataFrame | None,
+) -> dict:
+    result = {
+        "rows": int(len(kpi)),
+        "time_range_s": [float(kpi["time_s"].min()), float(kpi["time_s"].max())],
+        "mean_prr_awareness": float(kpi["prr_awareness"].mean()),
+        "mean_pir_s": float(kpi["pir_s"].mean()),
+        "mean_cbr": float(kpi["cbr"].mean()),
+        "cbr_gt_0p6_rate": float((kpi["cbr"] > 0.6).mean()),
+    }
+    for column, _ylabel, metric_name in TRAFFIC_CONTEXT_COLUMNS:
+        if column in kpi:
+            result[metric_name] = float(kpi[column].mean())
+    if applied is not None and len(applied):
+        result.update(
+            {
+                "control_updates": int(len(applied)),
+                "controller_success_rate": float(applied["response_success"].mean()),
+                "mean_applied_tx_power_dbm": float(applied["tx_power_dbm"].mean()),
+                "mean_applied_beacon_interval_s": float(applied["beacon_interval_s"].mean()),
+            }
+        )
+    if timing is not None and len(timing):
+        result.update(
+            {
+                "mean_bridge_wait_time_s": float(timing["wait_time_s"].mean()),
+                "max_bridge_wait_time_s": float(timing["wait_time_s"].max()),
+                "mean_controller_solve_time_s": float(timing["controller_solve_time_s"].mean()),
+                "max_controller_solve_time_s": float(timing["controller_solve_time_s"].max()),
+            }
+        )
+    if applied is not None and len(applied):
+        for column in ["max_up_residual", "max_yp_residual", "max_dp_residual", "max_df_residual"]:
+            if column in applied:
+                result[column] = float(applied[column].max())
+    if predictions is not None and len(predictions):
+        result["prediction_rows"] = int(len(predictions))
+    return result
+
+
+def plot_kpis(kpi: pd.DataFrame, out_dir: Path) -> None:
+    traffic_context = traffic_context_column(kpi)
+    row_count = 4 if traffic_context is not None else 3
+    fig, axes = plt.subplots(row_count, 1, figsize=(11, 9 if traffic_context else 7), sharex=True)
+    axes[0].plot(kpi["time_s"], kpi["prr_awareness"], color="tab:green")
+    axes[0].set_ylabel("PRR awareness")
+    axes[0].set_ylim(-0.03, 1.03)
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(kpi["time_s"], kpi["cbr"], color="tab:red")
+    axes[1].axhline(0.6, color="k", linestyle=":", linewidth=1)
+    axes[1].set_ylabel("CBR")
+    axes[1].grid(alpha=0.3)
+
+    axes[2].plot(kpi["time_s"], kpi["pir_s"], color="tab:blue")
+    axes[2].set_ylabel("PIR (s)")
+    axes[2].grid(alpha=0.3)
+
+    if traffic_context is not None:
+        column, ylabel, _metric_name = traffic_context
+        axes[3].plot(kpi["time_s"], kpi[column], color="tab:purple")
+        axes[3].set_ylabel(ylabel)
+        axes[3].grid(alpha=0.3)
+
+    axes[-1].set_xlabel("Time (s)")
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "kpi_timeseries.png", dpi=180)
+    plt.close(fig)
+
+
+def plot_controls(kpi: pd.DataFrame, applied: pd.DataFrame | None, out_dir: Path) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+    axes[0].plot(kpi["time_s"], kpi["tx_power_dbm"], label="KPI sampled input")
+    if applied is not None and len(applied):
+        axes[0].step(
+            applied["time_s"],
+            applied["tx_power_dbm"],
+            where="post",
+            linestyle="--",
+            label="Controller response",
+        )
+    axes[0].set_ylabel("Tx power (dBm)")
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(kpi["time_s"], kpi["beacon_interval_s"], label="KPI sampled input")
+    if applied is not None and len(applied):
+        axes[1].step(
+            applied["time_s"],
+            applied["beacon_interval_s"],
+            where="post",
+            linestyle="--",
+            label="Controller response",
+        )
+    axes[1].set_ylabel("Beacon interval (s)")
+    axes[1].set_xlabel("Time (s)")
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "controls.png", dpi=180)
+    plt.close(fig)
+
+
+def plot_controller(timing: pd.DataFrame | None, out_dir: Path) -> None:
+    if timing is None or not len(timing):
+        return
+    fig, axes = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+    axes[0].plot(timing["time_s"], timing["controller_solve_time_s"], marker=".")
+    axes[0].set_ylabel("Solve time (s)")
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(timing["time_s"], timing["wait_time_s"], marker=".", color="tab:orange")
+    axes[1].set_ylabel("ns-3 wait (s)")
+    axes[1].set_xlabel("Time (s)")
+    axes[1].grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "controller_timing.png", dpi=180)
+    plt.close(fig)
+
+
+def add_measured_predictions(
+    kpi: pd.DataFrame, predictions: pd.DataFrame
+) -> pd.DataFrame:
+    left = predictions.sort_values("predicted_time_s").copy()
+    right = kpi[
+        ["time_s", "prr_awareness", "pir_s", "cbr"]
+    ].sort_values("time_s").rename(
+        columns={
+            "prr_awareness": "measured_prr",
+            "pir_s": "measured_pir_s",
+            "cbr": "measured_cbr",
+        }
+    )
+    return pd.merge_asof(
+        left,
+        right,
+        left_on="predicted_time_s",
+        right_on="time_s",
+        direction="nearest",
+        tolerance=0.05,
+    )
+
+
+def plot_predictions(
+    kpi: pd.DataFrame, predictions: pd.DataFrame | None, out_dir: Path
+) -> None:
+    if predictions is None or not len(predictions):
+        return
+
+    fig, axes = plt.subplots(4, 1, figsize=(11, 10), sharex=True)
+    signals = [
+        ("predicted_tx_power_dbm", "Tx power (dBm)", None),
+        ("predicted_prr", "PRR", ("prr_awareness", "Measured")),
+        ("predicted_pir_s", "PIR (s)", ("pir_s", "Measured")),
+        ("predicted_cbr", "CBR", ("cbr", "Measured")),
+    ]
+    for _step, group in predictions.groupby("step"):
+        for axis, (column, _label, _measured) in zip(axes, signals):
+            axis.plot(
+                group["predicted_time_s"],
+                group[column],
+                color="tab:orange",
+                alpha=0.18,
+                linewidth=0.8,
+            )
+    for axis, (_column, label, measured) in zip(axes, signals):
+        if measured is not None:
+            axis.plot(kpi["time_s"], kpi[measured[0]], color="black", linewidth=1.0, label=measured[1])
+            axis.legend()
+        axis.set_ylabel(label)
+        axis.grid(alpha=0.3)
+    axes[-1].set_xlabel("Time (s)")
+    fig.tight_layout()
+    fig.savefig(out_dir / "prediction_trajectories_10_step.png", dpi=180)
+    plt.close(fig)
+
+    compared = add_measured_predictions(kpi, predictions).dropna(subset=["measured_prr"])
+    if compared.empty:
+        return
+    compared["prr_error"] = compared["predicted_prr"] - compared["measured_prr"]
+    compared["pir_error"] = compared["predicted_pir_s"] - compared["measured_pir_s"]
+    compared["cbr_error"] = compared["predicted_cbr"] - compared["measured_cbr"]
+    rows = []
+    for horizon, group in compared.groupby("horizon_step"):
+        row = {"horizon_step": int(horizon)}
+        for signal in ["prr", "pir", "cbr"]:
+            error = group[f"{signal}_error"]
+            row[f"{signal}_mae"] = float(error.abs().mean())
+            row[f"{signal}_rmse"] = float((error.pow(2).mean()) ** 0.5)
+        rows.append(row)
+    horizon_metrics = pd.DataFrame(rows).sort_values("horizon_step")
+    horizon_metrics.to_csv(out_dir / "prediction_error_by_horizon.csv", index=False)
+
+    fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+    for axis, signal, label in zip(axes, ["prr", "pir", "cbr"], ["PRR", "PIR (s)", "CBR"]):
+        axis.plot(
+            horizon_metrics["horizon_step"],
+            horizon_metrics[f"{signal}_rmse"],
+            marker="o",
+        )
+        axis.set_ylabel(f"{label} RMSE")
+        axis.grid(alpha=0.3)
+    axes[-1].set_xlabel("Prediction horizon step")
+    axes[-1].set_xticks(range(1, 11))
+    fig.tight_layout()
+    fig.savefig(out_dir / "prediction_error_by_horizon.png", dpi=180)
+    plt.close(fig)
+
+
+def main() -> None:
+    args = parse_args()
+    run_dir = resolve_run_dir(args)
+    out_dir = args.out_dir or run_dir / "plots"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    kpi_path = run_dir / "kpi_timeseries.csv"
+    if not kpi_path.exists():
+        raise FileNotFoundError(f"Missing KPI file: {kpi_path}")
+    kpi = add_prr_alias(pd.read_csv(kpi_path))
+    require_columns(
+        kpi,
+        kpi_path,
+        ["time_s", "tx_power_dbm", "beacon_interval_s", "prr_awareness", "pir_s", "cbr"],
+    )
+    applied = load_optional_csv([run_dir / "applied_controls.csv", run_dir / "bridge" / "applied_controls.csv"])
+    timing = load_optional_csv(
+        [run_dir / "controller_solve_times.csv", run_dir / "bridge" / "controller_solve_times.csv"]
+    )
+    predictions = load_optional_csv([run_dir / "predictions.csv", run_dir / "bridge" / "predictions.csv"])
+
+    plot_kpis(kpi, out_dir)
+    plot_controls(kpi, applied, out_dir)
+    plot_controller(timing, out_dir)
+    plot_predictions(kpi, predictions, out_dir)
+
+    summary = metrics(kpi, applied, timing, predictions)
+    with (out_dir / "summary_metrics.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Saved plots to {out_dir}")
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()

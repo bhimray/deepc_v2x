@@ -1,0 +1,898 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{xurl}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!55!black,
+    urlcolor=blue!55!black,
+    citecolor=blue!55!black
+}
+
+\setlist[itemize]{leftmargin=*}
+\setlist[enumerate]{leftmargin=*}
+\renewcommand{\arraystretch}{1.15}
+\graphicspath{{../}{./}}
+
+\newcommand{\deePC}{DeePC}
+\newcommand{\prr}{\mathrm{PRR}}
+\newcommand{\pir}{\mathrm{PIR}}
+\newcommand{\cbr}{\mathrm{CBR}}
+\newcommand{\artifact}[1]{\path{#1}}
+
+\title{\textbf{Progress Evaluation Report: \deePC-Based NR-V2X Sidelink Transmit-Power Adaptation}}
+\author{Bim\\
+\small ns-3 NR-V2X / NGSIM US-101 DeePC Study}
+\date{July 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Report purpose & Professor evaluation of completed research and engineering progress \\
+Main deliverable & Written progress-evaluation report \\
+Claim status & Feasibility and implementation progress; final performance claims pending \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\tableofcontents
+\newpage
+
+\section{Executive Summary}
+
+This report summarizes the current state of my research on Data-Enabled
+Predictive Control (\deePC) for adaptive NR-V2X sidelink communication. The
+central goal is to test whether measured vehicle-to-everything input-output
+data can support online transmit-power control in a realistic ns-3 NR-V2X
+simulation, with the controller balancing communication reliability,
+timeliness, and congestion. Reliability is measured using awareness-range
+packet reception ratio (PRR), timeliness is measured using packet
+inter-reception time (PIR), and congestion is measured using channel busy ratio
+(CBR).
+
+The main completed milestone is an end-to-end \deePC{} research pipeline. I
+have constructed \deePC-ready datasets from ns-3 KPI traces, generated
+normalized Hankel matrices, performed offline data-window checks, built
+closed-loop controller infrastructure through an ns-3 JSON file bridge, added a
+Python OSQP controller for online transmit-power control, prepared
+MATLAB/YALMIP export support, and generated campaign-level analysis tables and
+readiness reports. The current controller can receive recent ns-3 measurements,
+solve the \deePC{} optimization problem, and return a transmit-power command
+during the simulation.
+
+The strongest current result is feasibility rather than final performance
+superiority. In the available preliminary closed-loop run, the \deePC{}
+controller completed 285 online control updates with a 100\% controller
+success rate and a mean solve time of about 0.0199 s, which is far below the
+0.5 s control interval. The preliminary KPI values are close to the fixed
+10 Hz baseline: mean PRR is 0.5739 for \deePC{} and 0.5748 for fixed 10 Hz in
+the currently available partial evidence. Therefore, the work currently
+supports the claim that the closed-loop \deePC{} control pipeline is
+implemented and real-time compatible in this simulation setup. It does not yet
+support a final claim that \deePC{} improves PRR over fixed 10 Hz operation.
+
+The remaining major evaluation step is to complete matched repeated ns-3 runs
+for the main methods. The current paper-readiness report shows that the
+intended repeated campaign is not complete: fixed 10 Hz has partial run-101
+evidence, the \deePC{} run used for orientation is an extra non-matched run,
+and run IDs 101--105 are still missing for the main \deePC{} method. For this
+reason, all closed-loop comparison results in this report are treated as
+preliminary feasibility evidence.
+
+\subsection*{Evaluation Focus}
+
+The main points for evaluation are whether the ns-3 NR-V2X data pipeline is
+valid, whether the \deePC{} formulation is correctly constructed from measured
+input-output data, whether the ns-3 file bridge enables closed-loop control,
+whether the Python OSQP controller can solve within the 0.5 s control interval,
+and whether the preliminary 10 Hz results justify completing the matched
+repeated-run campaign.
+
+\section{Problem and Motivation}
+
+NR-V2X sidelink communication enables vehicles to exchange cooperative
+awareness messages directly, without routing every message through cellular
+infrastructure. This is important for cooperative and automated driving because
+nearby vehicles need timely information about position, speed, and motion
+state. In dense traffic, however, periodic message generation can create
+resource contention and interference. If transmit power is too low, vehicles
+may miss important packets. If transmit power is unnecessarily high, the
+channel can become more congested and neighboring transmissions may interfere
+more strongly.
+
+Fixed communication settings are easy to reproduce and are useful as baselines,
+but they do not react to measured network conditions. A fixed 10 Hz CAM
+configuration may be reasonable in moderate conditions, yet the best
+transmit-power choice can depend on the number of active vehicles, recent PRR,
+recent CBR, and other measured state. The research question for this stage is:
+
+\begin{quote}
+\textbf{Can measured NR-V2X input-output data support real-time predictive
+transmit-power control using \deePC?}
+\end{quote}
+
+This question is deliberately narrower than global optimization of NR-V2X. The
+current controller does not change SPS behavior, MCS, sensing parameters, CAM
+payload structure, or the reservation period. It focuses on transmit power as
+the controlled input while keeping the main comparison at fixed 10 Hz CAM
+generation. This makes the comparison with a fixed 10 Hz baseline cleaner:
+both methods generate CAMs at the same nominal rate, while \deePC{} is allowed
+to adapt transmit power.
+
+The control objective is to maintain or improve PRR while avoiding excessive
+CBR and keeping PIR reasonable. PRR and PIR measure application-facing
+awareness quality, while CBR measures congestion at the PHY layer. These
+metrics create a natural tradeoff: a lower message rate or lower transmit
+power can reduce CBR, but it may also increase PIR or reduce awareness
+reliability. \deePC{} is attractive because it can use collected input-output
+data directly rather than requiring a closed-form analytical model of the full
+NR-V2X network.
+
+\section{System and Dataset}
+
+The simulation environment is ns-3 with an NR-V2X sidelink scenario driven by
+processed NGSIM US-101 highway mobility. The final campaign folder identifies
+the scenario as ``NR-V2X CAM \deePC{} control over NGSIM US-101 mainline
+active-window mobility'' and uses the mobility file
+\artifact{data/processed/ngsim_us101_mainline_active20_250_densest_600s.csv}.
+The campaign configuration uses a 250-vehicle physical UE pool and dynamic
+active assignment. The processed mobility metadata reports 852 logical vehicle
+tracks, a peak of 179 simultaneous active vehicles, and a peak of 118 active
+core vehicles.
+
+\begin{table}[htbp]
+\centering
+\caption{Main evaluation configuration.}
+\label{tab:configuration}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Item & Value \\
+\midrule
+Simulator & ns-3 NR-V2X sidelink \\
+Mobility & NGSIM US-101 processed highway trajectories \\
+Physical UE pool & 250 UEs \\
+Simulation target & 300 s \\
+Warmup / cooldown & 10 s / 10 s \\
+KPI sample time & 0.5 s for final campaign data \\
+Control interval & 0.5 s \\
+Awareness range & 200 m \\
+Main CAM interval & 0.1 s, or 10 Hz \\
+Carrier frequency & 5.9 GHz \\
+MCS & 6 \\
+HARQ & Disabled in the current campaign \\
+Sidelink sensing & Enabled \\
+\deePC{} transmit-power bounds & 10 to 23 dBm \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Main \deePC{} signals.}
+\label{tab:signals}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Role & Signals \\
+\midrule
+Controlled input & \texttt{tx\_power\_dbm} \\
+Fixed/context input & \texttt{beacon\_interval\_s} \\
+Outputs & \texttt{prr\_awareness}, \texttt{pir\_s}, \texttt{cbr} \\
+Traffic context & \texttt{active\_vehicle\_count\_core} and related density variables \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The primary closed-loop dataset for the final campaign is stored under
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/01_training/}. The
+Tx-power-only, fixed-10-Hz \deePC{} dataset is
+\artifact{deepc_dataset_txpower_count_tb0p1_dt0p5_n10}. Its source KPI file is
+\artifact{kpi_timeseries_tb0p1_for_deepc.csv}, and it uses a sample time of
+0.5 s. The clean evaluation window contains 561 rows from 10.0 s to 290.0 s.
+The split is 336 training rows, 112 validation rows, and 113 test rows. The
+\deePC{} past horizon is 20 samples, or 10 s, and the future horizon is
+10 samples, or 5 s.
+
+\begin{table}[htbp]
+\centering
+\caption{Hankel blocks for the Tx-power-only final-campaign controller.}
+\label{tab:hankel}
+\begin{tabular}{lc}
+\toprule
+Hankel block & Shape \\
+\midrule
+\texttt{u\_p} & $20 \times 307$ \\
+\texttt{u\_f} & $10 \times 307$ \\
+\texttt{y\_p} & $60 \times 307$ \\
+\texttt{y\_f} & $30 \times 307$ \\
+\texttt{d\_p} & $40 \times 307$ \\
+\texttt{d\_f} & $20 \times 307$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Collected-Data Validity for Hankel Construction}
+
+Before constructing the Hankel matrices, I checked the collected ns-3 KPI
+trace for internal consistency and input excitation coverage. These checks do
+not represent field-measurement validation, but they are important for
+confirming that the \deePC{} matrices are built from coherent simulator-side
+input-output data.
+
+Figure~\ref{fig:packet-accounting} checks the packet-accounting basis of the
+training data. The PRR-related outputs are derived from transmitted packets,
+awareness-eligible packet opportunities, and successful receptions over time.
+This supports the use of the collected KPI trace as the measured output
+sequence for \deePC{} training.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{hankel_data_quality_corrected/packet_accounting_timeseries.png}
+    \caption{Packet-accounting time series used to validate the collected KPI traces before constructing Hankel matrices.}
+    \label{fig:packet-accounting}
+\end{figure}
+
+Figure~\ref{fig:prbs-inputs} shows the input trajectory and traffic context
+used before Hankel matrix construction. The transmit-power input changes over
+the training horizon, while the active-vehicle count captures time-varying
+traffic density. This variation is important because \deePC{} relies on
+informative input-output trajectories rather than a hand-derived analytical
+network model.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{hankel_data_quality_corrected/prbs_inputs_timeseries.png}
+    \caption{Input excitation and traffic-context time series used before Hankel matrix construction.}
+    \label{fig:prbs-inputs}
+\end{figure}
+
+\section{DeePC Mathematical Formulation}
+
+This section describes the mathematical controller used in the closed-loop
+Python OSQP implementation. The formulation is data-driven: it does not use an
+analytical NR-V2X channel or queueing model. Instead, it uses previously
+collected input-output trajectories from ns-3 to construct Hankel matrices and
+then chooses the future transmit-power sequence that best matches the desired
+communication behavior.
+
+\subsection{Signals and Normalization}
+
+At each sample $k$, the controller uses one control input,
+\[
+u_k =
+\begin{bmatrix}
+\texttt{tx\_power\_dbm}
+\end{bmatrix},
+\]
+three measured outputs,
+\[
+y_k =
+\begin{bmatrix}
+\texttt{prr\_awareness} &
+\texttt{pir\_s} &
+\texttt{cbr}
+\end{bmatrix}^{\top},
+\]
+and context variables,
+\[
+d_k =
+\begin{bmatrix}
+\texttt{active\_vehicle\_count\_core} &
+\texttt{beacon\_interval\_s}
+\end{bmatrix}^{\top}.
+\]
+For the main 10 Hz controller, the beacon interval is treated as fixed context
+at 0.1 s, while transmit power is the optimized input. All input, output, and
+context signals are normalized using the means and standard deviations saved in
+\artifact{scaler.json}. The optimization is solved in normalized coordinates,
+and the selected transmit power is converted back to dBm before being returned
+to ns-3.
+
+\subsection{Hankel Data Representation}
+
+Let the past horizon be $T_{\mathrm{ini}} = 20$ samples and the future horizon
+be $N = 10$ samples. Since the KPI/control sample time is 0.5 s, these
+correspond to 10 s of history and a 5 s prediction horizon. From the normalized
+training trajectory, block Hankel matrices are built and partitioned into past
+and future blocks:
+\[
+\begin{bmatrix}
+U_p \\
+U_f \\
+Y_p \\
+Y_f \\
+D_p \\
+D_f
+\end{bmatrix}.
+\]
+For the Tx-power-only final-campaign controller, the exported dimensions are:
+\[
+U_p \in \mathbb{R}^{20 \times 307}, \quad
+U_f \in \mathbb{R}^{10 \times 307},
+\]
+\[
+Y_p \in \mathbb{R}^{60 \times 307}, \quad
+Y_f \in \mathbb{R}^{30 \times 307},
+\]
+\[
+D_p \in \mathbb{R}^{40 \times 307}, \quad
+D_f \in \mathbb{R}^{20 \times 307}.
+\]
+The 307 columns correspond to the number of available Hankel windows from the
+training split. The decision variable is the coefficient vector
+\[
+g \in \mathbb{R}^{307},
+\]
+which selects a linear combination of previously observed trajectory segments.
+The central DeePC assumption is that a future trajectory consistent with the
+measured system can be represented through these Hankel columns.
+
+\subsection{Past Matching and Context Forecast}
+
+During closed-loop simulation, ns-3 sends the controller the most recent
+history vectors:
+\[
+u_{\mathrm{ini}} \in \mathbb{R}^{20}, \quad
+y_{\mathrm{ini}} \in \mathbb{R}^{60}, \quad
+d_{\mathrm{ini}} \in \mathbb{R}^{40}.
+\]
+The future context vector $d_f^{\mathrm{ref}}$ is not optimized. It is supplied
+as a forecast: the current implementation holds the latest active-vehicle count
+constant over the 10-step horizon and fixes the beacon interval at 0.1 s. The
+trajectory coefficient $g$ must match the measured past and the forecast
+context:
+\[
+U_p g = u_{\mathrm{ini}},
+\]
+\[
+Y_p g = y_{\mathrm{ini}},
+\]
+\[
+D_p g = d_{\mathrm{ini}}, \qquad D_f g = d_f^{\mathrm{ref}}.
+\]
+The predicted future input and output trajectories are then
+\[
+\hat{u}_f = U_f g,
+\]
+\[
+\hat{y}_f = Y_f g.
+\]
+Because $y_k$ has three components and $N=10$, $\hat{y}_f$ contains 30
+normalized values: predicted PRR, PIR, and CBR for each future step.
+
+\subsection{Optimization Problem}
+
+The Python controller solves the following quadratic program at each control
+update:
+\[
+\begin{aligned}
+\min_{g} \quad
+& \sum_{i=1}^{N}
+    \left\lVert \hat{y}_{i} - y^{\mathrm{ref}} \right\rVert_Q^2
+  + \sum_{i=1}^{N}
+    \left\lVert \hat{u}_{i} \right\rVert_R^2
+  + \lambda_g \lVert g \rVert_2^2 \\
+\text{s.t.} \quad
+& U_p g = u_{\mathrm{ini}}, \\
+& Y_p g = y_{\mathrm{ini}}, \\
+& D_p g = d_{\mathrm{ini}}, \\
+& D_f g = d_f^{\mathrm{ref}}, \\
+& u_{\min} \leq U_f g \leq u_{\max}.
+\end{aligned}
+\]
+Here, $y^{\mathrm{ref}}$ is the desired output target. The current controller
+uses:
+\[
+y^{\mathrm{ref}} =
+\begin{bmatrix}
+0.90 & 0.10 & 0.35
+\end{bmatrix}^{\top},
+\]
+corresponding to high PRR, low PIR, and moderate CBR. The output tracking
+weights are:
+\[
+Q = \mathrm{diag}(40,\;3,\;8),
+\]
+so PRR tracking is weighted most strongly, followed by CBR and PIR. The input
+penalty is $R = 0.002$, and the coefficient regularization is
+$\lambda_g = 10$. The physical transmit-power bounds are:
+\[
+10 \leq \texttt{tx\_power\_dbm} \leq 23.
+\]
+In the implementation these bounds are normalized before being passed to OSQP.
+
+\subsection{Receding-Horizon Application}
+
+After OSQP solves the quadratic program, the controller obtains the optimized
+future transmit-power sequence
+\[
+\hat{u}_f =
+\begin{bmatrix}
+\hat{u}_{k|k} &
+\hat{u}_{k+1|k} &
+\cdots &
+\hat{u}_{k+N-1|k}
+\end{bmatrix}^{\top}.
+\]
+Only the first value $\hat{u}_{k|k}$ is sent back to ns-3 and applied during
+the next 0.5 s control interval. At the next update, ns-3 provides a new
+measured history, the optimization is solved again, and the process repeats.
+This is the standard receding-horizon structure. The controller also logs the
+predicted PRR, PIR, CBR horizon, solve time, solver status, and equality
+residuals for later validation.
+
+\subsection{Interpretation for NR-V2X}
+
+In this formulation, \deePC{} is not predicting packets directly. It predicts
+future KPI behavior using measured input-output trajectories. The optimization
+therefore chooses transmit power by balancing three goals: keep PRR high, keep
+PIR low, and avoid excessive CBR. The current implementation controls only
+transmit power, while the 10 Hz CAM generation interval remains fixed. This is
+why the main closed-loop comparison is against the fixed 10 Hz baseline.
+
+\section{Implemented Work}
+
+\subsection{DeePC Data Pipeline}
+
+The first completed milestone was the offline \deePC{} data pipeline. I
+created a configurable script that can clean the KPI series, select
+input/output/context columns, split data into train/validation/test segments,
+normalize each signal, and export Hankel matrices. The generated artifacts
+include clean CSVs, normalized CSVs, \artifact{scaler.json},
+\artifact{dataset_summary.json}, and \artifact{hankel_train_normalized.npz}.
+
+\subsection{Offline Data-Window Check}
+
+The open-loop ns-3 run itself does not use \deePC{} control. It is only the
+data-collection run used to record input, output, and context trajectories.
+After that run, I constructed the \deePC{} dataset and Hankel matrices from the
+recorded data. As a separate offline diagnostic, I also fitted a linear ridge
+map from past input/output/context windows and known future input/context
+windows to future PRR, PIR, and CBR windows. This diagnostic checks whether the
+recorded open-loop trace contains usable input-output structure before the data
+is used in the closed-loop \deePC{} controller. The diagnostic metrics are
+shown in Table~\ref{tab:open-loop}.
+
+\begin{table}[htbp]
+\centering
+\caption{Offline held-out data-window check from the recorded open-loop ns-3 dataset.}
+\label{tab:open-loop}
+\begin{tabular}{llrrr}
+\toprule
+Diagnostic & Output & RMSE & MAE & $R^2$ \\
+\midrule
+Linear ridge window model & PRR & 0.049929 & 0.038993 & -1.063849 \\
+Linear ridge window model & PIR & 0.039214 & 0.032651 & 0.113547 \\
+Linear ridge window model & CBR & 0.019695 & 0.016011 & 0.356386 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\footnotesize Source:
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/01_training/open_loop_predictions/metrics.json}.
+\normalsize
+
+These RMSE values are not closed-loop performance results, and \deePC{} was
+not active during the open-loop ns-3 simulation. They are a post-processing
+diagnostic used before closed-loop control to check whether the collected
+input-output trace is suitable for Hankel-matrix construction. The current
+diagnostic is strongest for CBR and weaker for PRR, so PRR-related performance
+claims should come from the matched closed-loop campaign rather than from this
+offline check.
+
+\subsection{Closed-Loop Infrastructure}
+
+The ns-3 scenario has been prepared for true controller-in-the-loop simulation
+through a JSON file bridge. In bridge mode, ns-3 writes request files
+containing recent control, KPI, and context histories. An external controller
+reads those requests, solves an optimization problem, writes response files,
+and ns-3 applies the returned control action.
+
+Implemented bridge behavior includes:
+\begin{itemize}
+    \item request files under \artifact{bridge/requests/request_XXXXXX.json};
+    \item response files under \artifact{bridge/responses/response_XXXXXX.json};
+    \item applied-control logging in \artifact{bridge/applied_controls.csv};
+    \item controller timing in \artifact{bridge/controller_solve_times.csv};
+    \item protection against overwriting the original open-loop dataset;
+    \item rejection of bridge mode when the PRBS input schedule is still enabled.
+\end{itemize}
+
+\subsection{Controllers}
+
+Several controller paths have been implemented or prepared. First, a
+MATLAB/YALMIP path was prepared by exporting the normalized Hankel matrices and
+metadata to \artifact{matlab_deepc_data.mat}. The MATLAB file controller can
+watch the same bridge directory, solve a classical \deePC{} optimization in
+YALMIP, and write response JSON files using the same schema. This path has not
+been executed inside the Linux workspace because MATLAB is available separately
+on Windows.
+
+Second, a Python OSQP file controller was implemented in
+\artifact{scripts/deepc_osqp_file_controller.py}. This controller loads
+\artifact{dataset_summary.json}, \artifact{scaler.json}, and
+\artifact{hankel_train_normalized.npz}, checks that the request horizons and
+signal columns match the dataset, builds a CVXPY/OSQP optimization problem,
+enforces transmit-power bounds from 10 to 23 dBm, and writes predicted PRR,
+PIR, CBR, future transmit-power trajectories, solver status, solve time, and
+equality-residual diagnostics.
+
+Third, an acados-based offline surrogate controller was implemented. The
+acados work verifies that a receding-horizon controller can be generated and
+rolled out on a learned surrogate. The surrogate rollout improved predicted PRR
+and lowered predicted CBR relative to the measured held-out open-loop segment,
+but this is not yet an ns-3 closed-loop result and should not be presented as
+final network performance evidence.
+
+\subsection{Campaign Tooling}
+
+The final campaign folder is
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/}. It contains a
+campaign manifest, training artifacts, repeated-run directories, command
+scripts, analysis tables, plots, and an acceptance checklist. The aggregation
+script \artifact{scripts/aggregate_final_campaign.py} produces paper-facing
+outputs including \artifact{paper_readiness_report.md},
+\artifact{paper_main_table.csv}, \artifact{aggregate_metrics.csv},
+\artifact{run_metrics.csv}, density-bin tables, and comparison plots.
+
+This is important because the project is now reproducible enough to evaluate:
+there is a documented folder contract, exact command scripts for major stages,
+and generated readiness reports that identify which claims are safe and which
+runs are still missing.
+
+\section{Code and Artifact Map}
+
+To make the implementation easier to inspect, Table~\ref{tab:code-map} maps
+the main reported claims to the script or artifact that supports them. The
+Python OSQP controller source has also been commented around the bridge
+protocol, signal validation, normalization, Hankel-block usage, optimization
+objective, constraints, diagnostics, and receding-horizon response path.
+
+\begin{longtable}{p{0.34\linewidth}p{0.59\linewidth}}
+\caption{Main implementation files and artifacts for professor review.}
+\label{tab:code-map}\\
+\toprule
+File or artifact & Role in the project \\
+\midrule
+\endfirsthead
+\toprule
+File or artifact & Role in the project \\
+\midrule
+\endhead
+\artifact{scripts/build_hankel_dataset.py} & Builds the cleaned \deePC{} dataset, train/validation/test splits, normalization metadata, and Hankel matrices. \\
+\artifact{scripts/open_loop_deepc_predict.py} & Runs the offline held-out data-window diagnostic reported in Table~\ref{tab:open-loop}. \\
+\artifact{scripts/deepc_osqp_file_controller.py} & Implements the Python CVXPY/OSQP \deePC{} controller used by the ns-3 file bridge in the closed-loop run. \\
+\artifact{scripts/aggregate_final_campaign.py} & Aggregates run-level KPI metrics, readiness status, paper tables, and comparison plots. \\
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/01_training/deepc_dataset_txpower_count_tb0p1_dt0p5_n10/} & Final Tx-power-only \deePC{} dataset used by the controller. \\
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/fixed_10hz/run_101/} & Preliminary fixed 10 Hz baseline run used for the current comparison. \\
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/} & Preliminary \deePC{} closed-loop run used for feasibility evidence. \\
+\bottomrule
+\end{longtable}
+
+\section{Results and Evidence}
+
+\subsection{Collected Input-Output Simulation Evidence}
+
+The first result layer is the collected open-loop ns-3 data used to prepare
+the \deePC{} dataset. In this stage, \deePC{} is not controlling the simulator;
+the purpose is to collect measured input-output behavior under varying
+transmit-power and traffic-density conditions. The important evidence is that
+the simulation produces nonconstant PRR, PIR, and CBR values, and that these
+outputs vary with both the communication input and the observed traffic
+context.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{hankel_data_quality_corrected/metric_distributions.png}
+    \caption{Distribution of collected PRR, PIR, and CBR samples from the open-loop ns-3 training trace.}
+    \label{fig:metric-distributions}
+\end{figure}
+
+Figure~\ref{fig:metric-distributions} shows the measured output ranges used
+for data-driven modeling. This matters because a useful \deePC{} dataset should
+not contain only a single operating point; it should contain enough variation
+in the measured outputs to support later closed-loop optimization.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{hankel_data_quality_corrected/tx_power_io_relationships.png}
+    \caption{Collected open-loop input-output relationships between transmit power and PRR, PIR, and CBR. Red markers show mean output values at each transmit-power level.}
+    \label{fig:txpower-io}
+\end{figure}
+
+Figure~\ref{fig:txpower-io} summarizes the relationship between the controlled
+input, transmit power, and the measured communication outputs. The scatter is
+expected because PRR, PIR, and CBR are also affected by vehicle density,
+resource contention, and mobility. This is why the controller uses recent KPI
+history and traffic context rather than transmit power alone.
+
+\begin{table}[htbp]
+\centering
+\caption{Open-loop KPI behavior by observed traffic-density bin.}
+\label{tab:density-bin-open-loop}
+\begin{tabular}{lrrrr}
+\toprule
+Density bin & Mean active vehicles & Mean PRR & Mean PIR (s) & Mean CBR \\
+\midrule
+Low & 78.50 & 0.6814 & 0.2573 & 0.3497 \\
+Medium & 94.32 & 0.6658 & 0.2708 & 0.3632 \\
+High & 110.11 & 0.6469 & 0.2805 & 0.3753 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\footnotesize Source:
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/01_training/prbs_training_250veh_run001/analysis_plots/density_bin_summary.csv}.
+\normalsize
+
+Table~\ref{tab:density-bin-open-loop} shows the main density trend in the
+collected data. As the number of active vehicles increases, PRR decreases while
+PIR and CBR increase. This confirms that the control problem is not only a
+single-input problem; network density is an important context variable for
+interpreting the measured communication outputs.
+
+\subsection{Offline Data-Window Check Evidence}
+
+The offline data-window check shows that the collected ns-3 KPI trace contains
+some input-output structure after the open-loop data-collection run. On the
+current final-campaign training dataset, the linear ridge window diagnostic
+achieves overall RMSE values of 0.049929 for PRR, 0.039214 for PIR, and
+0.019695 for CBR.
+
+These values support the first research milestone: the open-loop ns-3 trace can
+be converted into a structured Hankel dataset for later closed-loop \deePC{}
+control. However, the mixed $R^2$ values mean this offline window check
+should be treated only as a data-representation diagnostic, not as evidence
+that \deePC{} was controlling the open-loop simulation.
+
+\subsection{Preliminary Closed-Loop Feasibility}
+
+The closed-loop simulation result presented in this report is restricted to
+10 Hz operation. The current comparison is preliminary because the repeated
+matched campaign is not finished. The available aggregate evidence is shown in
+Table~\ref{tab:closed-loop}.
+
+\begin{table}[htbp]
+\centering
+\caption{Preliminary closed-loop comparison. Use for orientation only until matched repeated runs are complete.}
+\label{tab:closed-loop}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+Method & Mean PRR & Mean PIR (s) & Mean CBR & CBR $>0.6$ & Success & Mean solve (s) \\
+\midrule
+Fixed 10 Hz, 20 dBm & 0.5748 & 0.1601 & 0.4103 & 0.0000 & -- & -- \\
+\deePC{} Tx-power control & 0.5739 & 0.1603 & 0.4104 & 0.0000 & 1.0000 & 0.0199 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\noindent\footnotesize Source:
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/03_analysis/tables/paper_main_table.csv}.
+\normalsize
+
+Both rows in Table~\ref{tab:closed-loop} are preliminary partial-run evidence,
+not completed matched repeated-run results.
+
+The direct comparison is \deePC{} versus fixed 10 Hz because both use 10 Hz
+CAM generation. This keeps the simulation-result discussion focused on the
+same nominal message-generation rate.
+
+The preliminary \deePC{} result is very close to fixed 10 Hz in PRR, PIR, and
+CBR. This means the current evidence should not be described as a demonstrated
+PRR gain. The positive result is that \deePC{} actively changes transmit power
+while maintaining comparable KPI behavior and solving fast enough for the
+online control interval. The available run reports 285 control updates, 100\%
+response success, a mean solve time of 0.0199 s, and a maximum solve time of
+0.167194 s. Both timing values are below the 0.5 s control interval.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{simulation_results_10hz/closed_loop_10hz_comparison.png}
+    \caption{Preliminary 10 Hz closed-loop comparison between the fixed 10 Hz baseline and the \deePC{} transmit-power controller.}
+    \label{fig:closed-loop-10hz-comparison}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{simulation_results_10hz/closed_loop_10hz_kpi_timeseries.png}
+    \caption{Preliminary 10 Hz KPI time-series comparison over the overlapping fixed 10 Hz and \deePC{} run interval.}
+    \label{fig:closed-loop-10hz-timeseries}
+\end{figure}
+
+Figure~\ref{fig:closed-loop-10hz-timeseries} shows the KPI behavior over time
+for the overlapping interval of the available fixed 10 Hz and \deePC{} runs.
+The curves support the table-level interpretation: the preliminary \deePC{}
+run is close to the fixed 10 Hz baseline, so the current result is best framed
+as feasibility and comparable behavior rather than proven PRR improvement.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{simulation_results_10hz/deepc_controls.png}
+    \caption{Applied transmit-power trajectory from the preliminary \deePC{} closed-loop run.}
+    \label{fig:deepc-controls}
+\end{figure}
+
+Figure~\ref{fig:deepc-controls} shows that the \deePC{} controller is not only
+being evaluated offline; it is actively sending transmit-power commands during
+the ns-3 run. The command remains within the configured 10--23 dBm bounds.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{simulation_results_10hz/deepc_controller_timing.png}
+    \caption{Controller solve-time behavior in the preliminary \deePC{} closed-loop run.}
+    \label{fig:controller-timing}
+\end{figure}
+
+Figure~\ref{fig:controller-timing} supports the real-time feasibility claim:
+the mean solve time is about 0.0199 s and the maximum observed solve time is
+0.167194 s, both below the 0.5 s control interval.
+
+\noindent\footnotesize Source:
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/bridge/controller_solve_times.csv}
+and
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/plots/summary_metrics.json}.
+\normalsize
+
+\subsection{Evidence Boundary}
+
+The paper-readiness report explicitly marks the repeated campaign as
+incomplete. For the intended matched run IDs 101--105, fixed 10 Hz currently
+has only a partial run 101 with KPI data ending at 161.0 s instead of the
+290 s evaluation end. The main \deePC{} method has missing run IDs 101--105,
+and the current \deePC{} result comes from an extra non-matched run, run 931.
+
+Therefore, the correct interpretation is:
+
+\begin{quote}
+The collected results validate the feasibility of \deePC-based online
+transmit-power adaptation for NR-V2X and motivate matched repeated-run
+evaluation.
+\end{quote}
+
+The report should not claim:
+
+\begin{quote}
+\deePC{} improves PRR over fixed 10 Hz.
+\end{quote}
+
+\section{Defensibility and Limitations}
+
+The work is defensible as a research progress milestone because it has moved
+from raw ns-3 traces to an operational closed-loop control pipeline. The
+implemented pieces include data extraction, \deePC{} dataset construction,
+offline data-window validation, bridge-based ns-3 integration, online optimization,
+diagnostic logging, and campaign aggregation. These are substantial engineering
+and research contributions even before the final statistical campaign is
+complete.
+
+The current defensible claims are:
+\begin{enumerate}
+    \item \deePC-ready NR-V2X datasets have been built from ns-3 NGSIM mobility traces.
+    \item A linear held-out data-window diagnostic has been evaluated on PRR, PIR, and CBR using the current final-campaign training dataset.
+    \item The ns-3 file bridge can apply external controller commands during a run.
+    \item The Python OSQP \deePC{} controller can solve online transmit-power commands with solve times well below the 0.5 s control interval in the preliminary run.
+    \item The current closed-loop evidence is comparable to fixed 10 Hz in the partial run but does not yet prove improvement.
+\end{enumerate}
+
+The main limitations are:
+\begin{enumerate}
+    \item The matched repeated campaign is incomplete, so confidence intervals across repeated runs are not meaningful yet.
+    \item The work currently uses one processed NGSIM US-101 active-window mobility scenario.
+    \item The validation is simulation-based and does not include field experiments.
+    \item The current controller adapts transmit power only; it does not control SPS parameters, MCS, or resource-selection settings.
+    \item Threshold-DCC should remain excluded from the main result table until the placeholder controller is replaced by a validated implementation.
+\end{enumerate}
+
+\section{Next Steps}
+
+The most important next step is to complete the matched repeated ns-3 campaign.
+The minimum professor- and paper-ready campaign should include the same run IDs
+for fixed 10 Hz and the selected \deePC{} method:
+\artifact{fixed_10hz} and \artifact{deepc_count_tb0p1_prr_only} for run IDs
+101--105. Each run should reach the evaluation end time, normally 290 s for
+the 300 s simulation with 10 s cooldown.
+
+After completing the runs, I should regenerate the campaign analysis with:
+
+\begin{verbatim}
+./v2x_env/bin/python scripts/aggregate_final_campaign.py
+\end{verbatim}
+
+The regenerated outputs should include:
+\begin{itemize}
+    \item \artifact{data/output/final/ieee_250veh_deepc_campaign_01/03_analysis/paper_readiness_report.md};
+    \item \artifact{data/output/final/ieee_250veh_deepc_campaign_01/03_analysis/tables/paper_main_table.csv};
+    \item \artifact{data/output/final/ieee_250veh_deepc_campaign_01/03_analysis/tables/aggregate_metrics.csv};
+    \item comparison plots under \artifact{data/output/final/ieee_250veh_deepc_campaign_01/03_analysis/plots/}.
+\end{itemize}
+
+Once the matched campaign is complete, the results should be checked against
+the defensibility checklist before any paper-style claim is made. The main
+table should report mean PRR, mean PIR, mean CBR, CBR $> 0.6$ rate, controller
+success rate, and mean solve time with 95\% confidence intervals across runs.
+The analysis should also include density-bin metrics and prediction-error
+diagnostics, because \deePC{} may be most useful in particular traffic-density
+regimes rather than uniformly across the whole scenario.
+
+If the completed matched runs show a statistically meaningful improvement or
+stability advantage, this progress report can be converted into a conference
+paper. If the completed runs show similar performance to fixed 10 Hz, the paper
+can still be framed around feasibility, reproducibility, and lessons learned
+for data-driven NR-V2X control.
+
+\section{Evidence and Reproducibility Pointers}
+
+The numerical claims in this report trace to the artifacts in
+Table~\ref{tab:evidence}.
+
+\begin{longtable}{p{0.31\linewidth}p{0.62\linewidth}}
+\caption{Evidence and artifact pointers.}
+\label{tab:evidence}\\
+\toprule
+Evidence & Artifact \\
+\midrule
+\endfirsthead
+\toprule
+Evidence & Artifact \\
+\midrule
+\endhead
+Research history and milestones & \artifact{docs/deepc_research_progress.md} \\
+Conservative paper narrative & \artifact{docs/deepc_nr_v2x_conference_paper_draft.md} \\
+Claim safety checklist & \artifact{docs/deepc_nr_v2x_defensibility_checklist.md} \\
+Offline data-window diagnostic metrics & \artifact{data/output/final/ieee_250veh_deepc_campaign_01/01_training/open_loop_predictions/metrics.json} \\
+Final campaign manifest & \artifact{data/output/final/ieee_250veh_deepc_campaign_01/campaign_manifest.json} \\
+Tx-power \deePC{} dataset summary & \artifact{data/output/final/ieee_250veh_deepc_campaign_01/01_training/deepc_dataset_txpower_count_tb0p1_dt0p5_n10/dataset_summary.json} \\
+Preliminary closed-loop table & \artifact{data/output/final/ieee_250veh_deepc_campaign_01/03_analysis/tables/paper_main_table.csv} \\
+Run-level preliminary metrics & \artifact{data/output/final/ieee_250veh_deepc_campaign_01/03_analysis/tables/run_metrics.csv} \\
+Paper readiness status & \artifact{data/output/final/ieee_250veh_deepc_campaign_01/03_analysis/paper_readiness_report.md} \\
+Acceptance checklist & \artifact{data/output/final/ieee_250veh_deepc_campaign_01/04_tests/acceptance_checklist.md} \\
+\bottomrule
+\end{longtable}
+
+\section{Evaluation Checklist}
+
+\begin{itemize}
+    \item ns-3 NR-V2X open-loop KPI data collected and checked.
+    \item \deePC-ready dataset generated with train, validation, and test splits.
+    \item Hankel matrices exported with documented dimensions.
+    \item \deePC{} mathematical formulation implemented for transmit-power control.
+    \item ns-3 JSON file bridge implemented for closed-loop control.
+    \item Python OSQP controller implemented and connected to ns-3.
+    \item Preliminary 10 Hz closed-loop result collected.
+    \item Controller success rate reached 100\% in the preliminary run.
+    \item Mean controller solve time was below the 0.5 s control interval.
+    \item Matched repeated runs 101--105 are still incomplete.
+\end{itemize}
+
+\section{Conclusion}
+
+This project has reached a meaningful implementation and feasibility milestone.
+I have built the \deePC{} data pipeline, checked the offline data-window representation,
+prepared the ns-3 closed-loop bridge, implemented online transmit-power
+optimization, and generated campaign-level analysis tooling. The preliminary
+closed-loop run shows that the controller can operate within the required
+control interval and produce KPI behavior comparable to fixed 10 Hz operation.
+
+The correct current conclusion is conservative: the work demonstrates a
+working end-to-end \deePC{} control pipeline and preliminary real-time
+feasibility for NR-V2X transmit-power adaptation. The next phase is to complete
+matched repeated runs so the final paper can determine whether this feasibility
+result also becomes a statistically defensible reliability or congestion-control
+improvement.
+
+\end{document}
