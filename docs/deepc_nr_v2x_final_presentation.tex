@@ -1,0 +1,432 @@
+\documentclass[aspectratio=1610,10pt]{beamer}
+
+\IfFileExists{beamerthemewildcat.sty}{%
+  \usetheme[
+    pattern=triangle,
+    color=nudarkblue,
+    font=poppins,
+    numbering=progressbar,
+    sectionpage=on,
+    agendastyle=pattern
+  ]{wildcat}%
+}{%
+  \usetheme{Madrid}
+  \usecolortheme{default}
+  \setbeamertemplate{footline}[frame number]
+}
+\setbeamertemplate{navigation symbols}{}
+
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\graphicspath{{../}{./}}
+
+\newcommand{\prr}{\mathrm{PRR}}
+\newcommand{\pir}{\mathrm{PIR}}
+\newcommand{\cbr}{\mathrm{CBR}}
+\newcommand{\tx}{P_{\mathrm{tx}}}
+\newcommand{\smallpath}[1]{\scriptsize\texttt{\detokenize{#1}}}
+
+\title[DeePC for NR-V2X]{Data-Enabled Predictive Control for NR-V2X Sidelink Transmit-Power Adaptation}
+\subtitle{Final presentation before paper drafting}
+\author{Bim}
+\institute{ns-3 NR-V2X / NGSIM US-101 Study}
+\date{June 2026}
+
+\IfFileExists{logo-northwestern.pdf}{%
+  \titlegraphic{\includegraphics[scale=0.25]{logo-northwestern.pdf}}%
+}{}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% ============================================================
+\section{Problem and Research Question}
+
+\begin{frame}{Motivation}
+  \begin{itemize}
+    \item Dense V2X traffic creates time-varying sidelink contention, interference, and channel occupancy.
+    \item Fixed communication settings are simple, but they do not react to measured network state.
+    \item The goal is to test whether measured input-output data can support closed-loop NR-V2X parameter adaptation.
+    \item This presentation focuses on a Tx-power-only DeePC controller with fixed 10 Hz beaconing.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Research Question}
+  \begin{block}{Main question}
+    Can Data-Enabled Predictive Control (DeePC) adapt NR-V2X sidelink transmit power online using measured PRR, PIR, CBR, and traffic-density context?
+  \end{block}
+
+  \vspace{0.5em}
+  \begin{itemize}
+    \item Controlled input: transmit power $\tx$.
+    \item Fixed setting: beacon interval $T_b=0.1$ s, i.e., 10 Hz.
+    \item Outputs: awareness-range PRR, PIR, and CBR.
+    \item Context/disturbance: active vehicle count in the evaluated core region.
+  \end{itemize}
+\end{frame}
+
+% ============================================================
+\section{Simulation Setup}
+
+\begin{frame}{Simulation Scenario}
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{ll}
+      \toprule
+      Item & Value \\
+      \midrule
+      Simulator & ns-3 NR-V2X sidelink \\
+      Mobility data & NGSIM US-101 processed highway trajectories \\
+      Simulation duration & 300 s target campaign \\
+      Current closed-loop run & partial run from 0.5 s to 162.0 s \\
+      Warmup / cooldown & 10 s / 10 s \\
+      KPI sample time & 0.5 s \\
+      KPI window & 1.0 s \\
+      Awareness range & 200 m \\
+      Core filter & enabled, longitudinal core $y \in [120,415.136]$ m \\
+      Logical vehicles loaded & 852 \\
+      Physical UE pool & 250 UEs, dynamic active assignment \\
+      Peak simultaneous active vehicles & 179 \\
+      Peak active core vehicles & 118 \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+\end{frame}
+
+\begin{frame}{Radio and CAM Parameters}
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{ll}
+      \toprule
+      Parameter & Value \\
+      \midrule
+      Carrier frequency & 5.9 GHz \\
+      Bandwidth & 10 MHz \\
+      MCS & 6 \\
+      Max CAM encoded size & 300 bytes \\
+      CAM generation & fixed periodic, ETSI CAM trigger disabled \\
+      Beacon interval & $0.1$ s fixed for closed-loop evaluation \\
+      Sidelink sensing & enabled \\
+      HARQ & disabled in current closed-loop campaign \\
+      Subchannel size & 20 RBs \\
+      Selection window & 20 slots \\
+      Reservation period & 100 ms \\
+      Sensing $T_1/T_2$ & 2 / 33 slots \\
+      PSSCH RSRP threshold & -128 dBm \\
+      Tx-power constraint & $10 \leq \tx \leq 23$ dBm \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+\end{frame}
+
+% ============================================================
+\section{Data and DeePC Formulation}
+
+\begin{frame}{Measured KPIs}
+  \begin{align*}
+    \prr &= \frac{N_{\mathrm{successful}}}{N_{\mathrm{eligible}}}, \\
+    y_k &= [\prr_k,\ \pir_k,\ \cbr_k]^\top .
+  \end{align*}
+
+  \begin{itemize}
+    \item PRR uses eligible transmitter-receiver opportunities within 200 m at transmission time.
+    \item PIR measures packet inter-reception time at receivers.
+    \item CBR is the PHY busy-time fraction over the 1 s KPI window.
+    \item KPIs are sampled every 0.5 s and filtered to the central corridor core.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Open-Loop Training Data}
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{ll}
+      \toprule
+      Item & Value \\
+      \midrule
+      Training run & run 001 \\
+      Original data path & \smallpath{01_training/prbs_training_250veh_run001/kpi_timeseries.csv} \\
+      Clean evaluation rows & 561 \\
+      Time range used & 10.0 s to 290.0 s \\
+      Input for current controller & $\tx$ only \\
+      Outputs & $\prr$, $\pir$, $\cbr$ \\
+      Context & active vehicle count, beacon interval \\
+      Counterfactual fixed-beacon CSV & \smallpath{kpi_timeseries_tb0p1_for_deepc.csv} \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+
+  \vspace{0.4em}
+  \alert{Important caveat:} the fixed-$0.1$ training CSV overwrites only the beacon-interval column. KPI outputs still come from the original PRBS input run.
+\end{frame}
+
+\begin{frame}{Hankel Dataset}
+  Sampling time is $\Delta t=0.5$ s.
+
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{lll}
+      \toprule
+      Quantity & Samples & Time \\
+      \midrule
+      Past horizon $T_{\mathrm{ini}}$ & 20 & 10 s \\
+      Prediction horizon $N$ & 10 & 5 s \\
+      Control interval & 1 sample & 0.5 s \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{ll}
+      \toprule
+      Hankel block & Dimension \\
+      \midrule
+      $U_p$ & $20 \times 307$ \\
+      $U_f$ & $10 \times 307$ \\
+      $Y_p$ & $60 \times 307$ \\
+      $Y_f$ & $30 \times 307$ \\
+      $D_p$ & $40 \times 307$ \\
+      $D_f$ & $20 \times 307$ \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+\end{frame}
+
+\begin{frame}{DeePC Signals}
+  \begin{align*}
+    u_k &= \tx_k, \\
+    y_k &= [\prr_k,\ \pir_k,\ \cbr_k]^\top, \\
+    d_k &= [n_{\mathrm{active},k},\ T_{b,k}]^\top .
+  \end{align*}
+
+  \begin{itemize}
+    \item $n_{\mathrm{active}}$ is the active core vehicle count.
+    \item $T_b$ is treated as fixed context, not a controlled input.
+    \item Future context forecast:
+      \begin{itemize}
+        \item active vehicle count: hold-last forecast;
+        \item beacon interval: fixed at $0.1$ s for all prediction steps.
+      \end{itemize}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{DeePC Optimization}
+  At every 0.5 s control step, solve for the behavioral coefficient vector $g$:
+
+  \begin{align*}
+    \min_g \quad
+    & \|U_f g\|_R^2 + \|Y_f g-r\|_Q^2 + \lambda_g \|g\|_2^2 \\
+    \mathrm{s.t.}\quad
+    & U_p g = u_{\mathrm{ini}}, \\
+    & Y_p g = y_{\mathrm{ini}}, \\
+    & D_p g = d_{\mathrm{ini}}, \\
+    & D_f g = d_f, \\
+    & 10 \leq U_f g \leq 23 .
+  \end{align*}
+
+  Only the first predicted Tx-power value is applied, then the problem is solved again at the next control step.
+\end{frame}
+
+\begin{frame}{Optimization Weights}
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{ll}
+      \toprule
+      Parameter & Value \\
+      \midrule
+      PRR reference & 0.90 \\
+      PIR reference & 0.10 s \\
+      CBR reference & 0.35 \\
+      Input penalty $R$ & 0.002 repeated over 10 steps \\
+      Regularization $\lambda_g$ & 10.0 \\
+      PRR-only weights & $q_{\prr}=40,\ q_{\pir}=0,\ q_{\cbr}=0$ \\
+      CBR-only weights & $q_{\prr}=0,\ q_{\pir}=0,\ q_{\cbr}=8$ \\
+      PIR-only weights & $q_{\prr}=0,\ q_{\pir}=3,\ q_{\cbr}=0$ \\
+      Solver & CVXPY with OSQP \\
+      Residual tolerance & $10^{-5}$ \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+\end{frame}
+
+% ============================================================
+\section{Closed-Loop Implementation}
+
+\begin{frame}{Closed-Loop Architecture}
+  \begin{enumerate}
+    \item ns-3 collects the latest 20 samples of $u$, $y$, and $d$.
+    \item ns-3 writes a JSON request to the file bridge.
+    \item Python/CVXPY solves the DeePC QP using OSQP.
+    \item Python writes predicted 10-step trajectories and the first control action.
+    \item ns-3 applies only the first Tx-power value for the next 0.5 s.
+  \end{enumerate}
+
+  \vspace{0.5em}
+  \small
+  Current run path:
+  \smallpath{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931}
+\end{frame}
+
+\begin{frame}{Closed-Loop Command}
+  \scriptsize
+  \begin{block}{PRR-only fixed-10 Hz DeePC run}
+  \texttt{DATASET\_DIR=data/output/final/ieee\_250veh\_deepc\_campaign\_01/01\_training/deepc\_dataset\_txpower\_count\_tb0p1\_dt0p5\_n10 \textbackslash}\\
+  \texttt{METHOD=deepc\_count\_tb0p1\_prr\_only \textbackslash}\\
+  \texttt{DEEPC\_CONTROLLER\_ARGS="--q-prr 40 --q-pir 0 --q-cbr 0" \textbackslash}\\
+  \texttt{data/output/final/ieee\_250veh\_deepc\_campaign\_01/commands/run\_deepc\_python\_txpower.sh 931}
+  \end{block}
+
+  \vspace{0.5em}
+  \begin{itemize}
+    \item Target duration: 300 s.
+    \item Current completed partial result: 162 s.
+    \item Plot folder: \smallpath{run_931/plots}
+  \end{itemize}
+\end{frame}
+
+% ============================================================
+\section{Results}
+
+\begin{frame}{Main Result Summary}
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{lrrrrrr}
+      \toprule
+      Method & Time (s) & PRR & PIR (s) & CBR & Mean $\tx$ & Mean $T_b$ \\
+      \midrule
+      Fixed 10 Hz & 161.0 & 0.541 & 0.151 & 0.386 & 20.00 & 0.10 \\
+      DeePC PRR-only & 162.0 & 0.540 & 0.151 & 0.386 & 18.10 & 0.10 \\
+      Fixed 5 Hz & 119.5 & 0.467 & 0.256 & 0.273 & 20.00 & 0.20 \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+
+  \vspace{0.5em}
+  \begin{itemize}
+    \item DeePC achieved fixed-10 Hz-like PRR/PIR/CBR over the completed interval.
+    \item Mean applied Tx power was reduced from 20 dBm to about 18.10 dBm.
+    \item This is a feasibility result, not yet a definitive reliability improvement.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Controller Health}
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{lr}
+      \toprule
+      Quantity & Value \\
+      \midrule
+      KPI rows & 324 \\
+      Control updates & 285 \\
+      Controller success rate & 100\% \\
+      Mean solve time & 0.0199 s \\
+      Max solve / bridge wait time & 0.167 s / 0.202 s \\
+      Mean applied Tx power & 18.10 dBm \\
+      Mean beacon interval & 0.1 s \\
+      Max equality residuals & 0.0 in logged run \\
+      Prediction rows logged & 2850 \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+\end{frame}
+
+\begin{frame}{Closed-Loop KPI Time Series}
+  \centering
+  \includegraphics[width=0.92\linewidth]{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/plots/kpi_timeseries.png}
+\end{frame}
+
+\begin{frame}{Applied Control}
+  \centering
+  \includegraphics[width=0.92\linewidth]{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/plots/controls.png}
+\end{frame}
+
+\begin{frame}{Prediction Trajectories}
+  \centering
+  \includegraphics[width=0.92\linewidth]{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/plots/prediction_trajectories_10_step.png}
+\end{frame}
+
+\begin{frame}{Prediction Error and Timing}
+  \begin{columns}
+    \begin{column}{0.49\linewidth}
+      \centering
+      \includegraphics[width=\linewidth]{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/plots/prediction_error_by_horizon.png}
+    \end{column}
+    \begin{column}{0.49\linewidth}
+      \centering
+      \includegraphics[width=\linewidth]{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/plots/controller_timing.png}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ============================================================
+\section{Discussion and Next Steps}
+
+\begin{frame}{Discussion}
+  \begin{itemize}
+    \item The closed-loop bridge is working: OSQP returns feasible controls at every logged control step.
+    \item The controller maintains fixed-10 Hz-like PRR/PIR/CBR while using lower mean Tx power.
+    \item The current result is conservative: PRR does not improve clearly over fixed 10 Hz, but power is reduced.
+    \item Context helps make the DeePC problem density-conditioned, but hold-last vehicle-count forecasting is simple.
+    \item The fixed-$0.1$ Hankel dataset is counterfactual because it reuses outputs from a PRBS beacon-interval training run.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{What Is Scientifically Strong Already?}
+  \begin{itemize}
+    \item Realistic microscopic mobility from NGSIM US-101.
+    \item Dynamic physical-UE pool avoids creating one NR UE per logical vehicle.
+    \item Closed-loop ns-3-to-Python controller runs online, not post-processed offline only.
+    \item DeePC optimization uses measured histories and Hankel behavior constraints.
+    \item Controller diagnostics, predicted trajectories, residuals, and timing are logged.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Limitations Before Paper Submission}
+  \begin{itemize}
+    \item Need full 300 s completed runs for PRR-only, CBR-only, and PIR-only objectives.
+    \item Need repeated seeds or repeated runs for credible comparison.
+    \item Need a clean fixed-10 Hz Tx-power-excitation training run, instead of counterfactual beacon-column overwrite.
+    \item Need compare against fixed 10 Hz and fixed 5 Hz over matched time windows.
+    \item Need final choice on HARQ setting and align all baselines with that choice.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Draft Paper Story}
+  \begin{enumerate}
+    \item Build a realistic NR-V2X NGSIM simulation with packet-level PRR/PIR/CBR logging.
+    \item Collect open-loop input-output training data.
+    \item Build Hankel matrices for Tx-power-only DeePC.
+    \item Add active vehicle count and fixed beacon interval as measured context.
+    \item Run closed-loop DeePC through a file bridge with OSQP.
+    \item Show feasibility, controller timing, prediction quality, and comparison against fixed-rate baselines.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Takeaway}
+  \begin{block}{Main message}
+    DeePC can be integrated with an ns-3 NR-V2X sidelink simulation and can control transmit power online under realistic NGSIM traffic while maintaining fixed-10 Hz-like KPIs with lower mean transmit power.
+  \end{block}
+
+  \vspace{0.8em}
+  \begin{block}{Next paper step}
+    Replace the counterfactual fixed-beacon Hankel dataset with a clean fixed-10 Hz open-loop Tx-power-excitation dataset and repeat matched closed-loop baseline comparisons.
+  \end{block}
+\end{frame}
+
+\end{document}

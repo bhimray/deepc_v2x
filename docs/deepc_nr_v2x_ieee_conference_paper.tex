@@ -1,0 +1,197 @@
+\documentclass[conference]{IEEEtran}
+
+\IEEEoverridecommandlockouts
+
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{cite}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{xcolor}
+
+\newcommand{\prr}{\mathrm{PRR}}
+\newcommand{\pir}{\mathrm{PIR}}
+\newcommand{\cbr}{\mathrm{CBR}}
+
+\begin{document}
+
+\title{Data-Enabled Predictive Control for Closed-Loop NR-V2X Sidelink Transmit-Power Adaptation}
+
+\author{
+\IEEEauthorblockN{First Author, Second Author}
+\IEEEauthorblockA{
+Department or Laboratory\\
+University or Organization\\
+City, Country\\
+email@example.com}
+}
+
+\maketitle
+
+\begin{abstract}
+Reliable vehicle-to-everything communication is essential for cooperative and automated driving, particularly in dense highway scenarios where sidelink resource contention and channel variations can degrade packet reception. This paper investigates data-enabled predictive control (DeePC) for closed-loop transmit-power adaptation in NR-V2X sidelink communication. The proposed controller is trained from input-output measurements collected in ns-3 and evaluated using realistic NGSIM US-101 vehicle trajectories in a 250-vehicle active-window highway scenario. Performance is measured using awareness-range packet reception ratio (PRR), packet inter-reception time (PIR), and channel busy ratio (CBR) within a 200 m communication-awareness range. The currently collected partial outputs show that the DeePC controller completed 285 online control updates with 100\% response success and a mean solve time of 0.0199 s, while producing PRR, PIR, and CBR values comparable to fixed 10 Hz operation. These results validate the feasibility of closed-loop DeePC for NR-V2X transmit-power adaptation and motivate matched repeated-run validation before reporting definitive reliability gains.
+\end{abstract}
+
+\begin{IEEEkeywords}
+NR-V2X, sidelink, data-enabled predictive control, DeePC, ns-3, NGSIM, congestion control.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+NR-V2X sidelink communication enables vehicles to exchange cooperative awareness information without relying on network infrastructure. This capability is important for automated driving, cooperative perception, maneuver coordination, and safety applications. In dense highway traffic, however, periodic cooperative awareness messages can create contention and interference, and fixed communication parameters may not remain suitable as vehicle density and channel conditions vary over time.
+
+Congestion-control and resource-adaptation mechanisms for vehicular communication are often designed using explicit rules, analytical models, or protocol-specific heuristics. These approaches are useful, but they can be difficult to tune across mobility patterns, traffic densities, and radio conditions. This paper studies a complementary direction: using measured input-output data from an NR-V2X simulation to control sidelink parameters online without deriving an explicit analytical model of the full communication system.
+
+We focus on data-enabled predictive control (DeePC), a model-free predictive-control method that uses Hankel matrices constructed from measured trajectories to predict future system behavior and optimize control actions \cite{coulson2019deepc}. In the proposed NR-V2X setting, the controlled input is transmit power, while the measured outputs are PRR, PIR, and CBR. The controller observes recent communication performance and vehicle-density context, solves a DeePC optimization problem, and applies the first transmit-power action through a closed-loop ns-3 bridge.
+
+The main contributions are:
+\begin{itemize}
+    \item an ns-3/NGSIM closed-loop evaluation framework for NR-V2X cooperative awareness message dissemination with packet-level KPI logging;
+    \item a DeePC-based transmit-power controller operating every 0.5 s using measured PRR, PIR, CBR, and active-vehicle-count context;
+    \item a conference-oriented experimental protocol for comparing DeePC against fixed 10 Hz operation and contextual lower-rate baselines under realistic NGSIM US-101 mobility.
+\end{itemize}
+
+\section{Related Work}
+
+NR-V2X sidelink was introduced to support advanced V2X services with direct communication, flexible numerology, and sensing-based resource selection. Garcia \emph{et al.} provide a comprehensive tutorial on NR-V2X architecture, sidelink operation, and use cases \cite{garcia2021tutorial}. Existing congestion-control work has investigated DCC mechanisms, resource reservation interval adaptation, packet dropping, and sensing-based scheduling. McCarthy and O'Driscoll study congestion control in the C-V2X sidelink and evaluate adaptive RRI behavior \cite{mccarthy2021congestion}. Cao \emph{et al.} model packet reception ratio for NR sidelink Mode 2 semi-persistent scheduling and validate the model using ns-3 \cite{cao2023sps}. Dayal \emph{et al.} examine adaptive RRI selection to improve cooperative awareness in decentralized NR-V2X \cite{dayal2023adaptive}.
+
+Learning and data-driven control have also been explored in connected-vehicle systems. Wang \emph{et al.} use data-driven predictive control for connected and autonomous vehicles in mixed traffic \cite{wang2021datadriven}. In contrast, this paper applies DeePC to the communication layer rather than vehicle longitudinal motion. The goal is not to replace standards-level sidelink resource selection, but to evaluate whether measured communication data can support closed-loop NR-V2X parameter adaptation in realistic simulated mobility.
+
+\section{System Model and Metrics}
+
+\subsection{Scenario}
+
+The study uses an ns-3 NR-V2X sidelink scenario with processed NGSIM US-101 vehicle trajectories \cite{ngsim}. The processed active-window mobility file contains selected highway vehicle tracks with a dynamic physical-UE pool. The final paper campaign is frozen to a 300 s simulation, with 10 s warmup and 10 s cooldown periods. The main communication-awareness range is 200 m.
+
+Vehicles generate cooperative awareness messages periodically. For the primary fair comparison, CAM generation is held fixed at 10 Hz, corresponding to a beacon interval of 0.1 s. The DeePC controller changes only transmit power, constrained between 10 dBm and 23 dBm. Sidelink sensing is enabled and HARQ is disabled.
+
+\subsection{Metrics}
+
+The primary reliability metric is awareness-range PRR:
+\begin{equation}
+\prr = \frac{N_{\mathrm{succ}}}{N_{\mathrm{eligible}}},
+\end{equation}
+where $N_{\mathrm{eligible}}$ is the number of transmitter-receiver opportunities within the 200 m awareness range at the transmission time, and $N_{\mathrm{succ}}$ is the number of unique successful receptions for those opportunities.
+
+Timeliness is measured by PIR, the packet inter-reception time observed at receiving vehicles. Channel load is measured by CBR, computed as the PHY busy-time fraction over the KPI sampling window using the `NrSpectrumPhy::ChannelOccupied' trace. The main paper reports mean PRR, mean PIR, mean CBR, the fraction of KPI samples with $\cbr > 0.6$, controller success rate, and controller solve time.
+
+\section{Data-Enabled Predictive Control}
+
+\subsection{Input-Output Data}
+
+The DeePC dataset is constructed from open-loop input-output measurements. The controlled input is
+\begin{equation}
+u_k = P_{\mathrm{tx},k},
+\end{equation}
+where $P_{\mathrm{tx},k}$ is the transmit power in dBm. The output vector is
+\begin{equation}
+y_k = [\prr_k,\ \pir_k,\ \cbr_k]^\top.
+\end{equation}
+The context vector contains the active vehicle count in the evaluated core region and the beacon interval:
+\begin{equation}
+d_k = [n_{\mathrm{active},k},\ T_{\mathrm{beacon},k}]^\top.
+\end{equation}
+
+The DeePC dataset uses a sampling period of 0.5 s. The past horizon is $T_{\mathrm{ini}}=20$ samples, corresponding to 10 s, and the future horizon is $N=10$ samples, corresponding to 5 s.
+
+\subsection{Optimization Problem}
+
+Let $U_p$, $U_f$, $Y_p$, $Y_f$, $D_p$, and $D_f$ denote Hankel matrices formed from the training data. At each control step, DeePC seeks a coefficient vector $g$ such that the observed history and predicted future lie in the behavioral span of the data:
+\begin{equation}
+\begin{bmatrix}
+U_p\\
+Y_p\\
+D_p\\
+D_f
+\end{bmatrix}g
+=
+\begin{bmatrix}
+u_{\mathrm{ini}}\\
+y_{\mathrm{ini}}\\
+d_{\mathrm{ini}}\\
+d_f
+\end{bmatrix}.
+\end{equation}
+The predicted future input and output are
+\begin{equation}
+u_f = U_f g, \qquad y_f = Y_f g.
+\end{equation}
+
+The implemented controller solves a regularized quadratic program:
+\begin{align}
+\min_g \quad &
+\|y_f - y_{\mathrm{ref}}\|_Q^2 + \|u_f\|_R^2 + \lambda_g \|g\|_2^2\\
+\mathrm{s.t.}\quad &
+U_p g = u_{\mathrm{ini}},\quad Y_p g = y_{\mathrm{ini}},\\
+&D_p g = d_{\mathrm{ini}},\quad D_f g = d_f,\\
+&10 \leq u_{f,i} \leq 23,\quad i=1,\ldots,N.
+\end{align}
+Only the first transmit-power action is applied, and the optimization is repeated every 0.5 s.
+
+\section{Evaluation Methodology}
+
+\subsection{Baselines}
+
+The main baseline is fixed 10 Hz operation with transmit power fixed at 20 dBm. This is the fairest direct comparison because DeePC also keeps CAM generation fixed at 10 Hz. A fixed 5 Hz baseline is included only as a contextual lower-load baseline because it changes the offered message load. Threshold-DCC results are excluded from the main table until a non-placeholder threshold-DCC controller is implemented and validated.
+
+\subsection{Matched-Run Protocol}
+
+The final conference-ready campaign uses runs 101--105 for each main method. Each run must reach the 290 s evaluation endpoint corresponding to a 300 s simulation with a 10 s cooldown. The final paper table will report means and 95\% confidence intervals across runs.
+
+\begin{table}[t]
+\centering
+\caption{Frozen experiment configuration for the final matched campaign.}
+\label{tab:config}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value\\
+\midrule
+Mobility trace & NGSIM US-101 active-window\\
+Simulation time & 300 s\\
+Warmup/cooldown & 10 s / 10 s\\
+Awareness range & 200 m\\
+Main CAM interval & 0.1 s\\
+DeePC control interval & 0.5 s\\
+Tx-power range & 10--23 dBm\\
+Past/future horizons & 20 / 10 samples\\
+Primary baseline & Fixed 10 Hz, 20 dBm\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Preliminary Results}
+
+Table~\ref{tab:preliminary} reports the currently available metrics generated by the campaign aggregation script. These are the results collected so far, but they are not final numerical claims because the current outputs are not yet a matched repeated-run set. In particular, the present DeePC result comes from a non-matched exploratory run, and the fixed baselines are partial under the frozen 300 s campaign definition.
+
+\begin{table*}[t]
+\centering
+\caption{Preliminary orientation metrics from currently available outputs. These are not final paper claims; matched runs 101--105 are required before reporting gains.}
+\label{tab:preliminary}
+\begin{tabular}{lcccccc}
+\toprule
+Method & Mean PRR & Mean PIR (s) & Mean CBR & CBR $>$ 0.6 & Controller success & Mean solve time (s)\\
+\midrule
+Fixed 10 Hz, 20 dBm & 0.5748 & 0.1601 & 0.4103 & 0.0000 & -- & --\\
+Fixed 5 Hz, 20 dBm & 0.5527 & 0.3028 & 0.3238 & 0.0000 & -- & --\\
+DeePC Tx-power control & 0.5739 & 0.1603 & 0.4104 & 0.0000 & 1.0000 & 0.0199\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The current evidence is useful mainly for validating the closed-loop mechanism. DeePC produced a mean PRR of 0.5739, mean PIR of 0.1603 s, and mean CBR of 0.4104 in the collected exploratory run. The partial fixed 10 Hz baseline produced similar values: mean PRR of 0.5748, mean PIR of 0.1601 s, and mean CBR of 0.4103. Thus, the current data should be interpreted as a feasibility result rather than as proof of a reliability improvement. The controller successfully produces feasible transmit-power actions within the 10--23 dBm range, maintains the 10 Hz CAM interval, and solves well within the 0.5 s control interval. Final reliability and congestion claims will be made only after the matched campaign is complete.
+
+\section{Discussion and Limitations}
+
+The current study is intentionally narrow. It evaluates one processed NGSIM US-101 active-window scenario and controls only transmit power. CAM generation rate, sensing-window configuration, resource-selection parameters, MCS, and HARQ behavior are not optimized. The evaluation is simulation-based and does not include field measurements. These constraints make the current design suitable as a first conference contribution, but broader density cases, additional mobility traces, and a validated DCC baseline are important extensions.
+
+The most important methodological risk is comparing non-matched runs or partial simulations. To avoid this, final numerical claims will be restricted to completed matched runs with identical simulation duration, warmup/cooldown windows, mobility input, KPI definitions, and seed set.
+
+\section{Conclusion}
+
+This paper presents a DeePC-based framework for closed-loop NR-V2X sidelink transmit-power adaptation under realistic NGSIM mobility. The proposed controller uses measured input-output behavior from ns-3 to predict communication performance and select transmit-power actions online. Preliminary outputs validate the feasibility of the control loop and show real-time-compatible solve times. The final matched campaign will determine whether the current DeePC configuration provides statistically defendable improvements in awareness-range reliability while maintaining comparable channel occupancy.
+
+\bibliographystyle{IEEEtran}
+\bibliography{deepc_nr_v2x_ieee_references}
+
+\end{document}

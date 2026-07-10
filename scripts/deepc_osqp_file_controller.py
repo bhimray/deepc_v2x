@@ -16,7 +16,10 @@ import numpy as np
 
 INPUT_COLS = ["tx_power_dbm"]
 OUTPUT_COLS = ["prr_awareness", "pir_s", "cbr"]
-CONTEXT_COLS = ["active_vehicle_count_core"]
+COUNT_CONTEXT_COLS = ["active_vehicle_count_core"]
+COUNT_BEACON_CONTEXT_COLS = ["active_vehicle_count_core", "beacon_interval_s"]
+SUPPORTED_CONTEXT_COLS = [[], COUNT_CONTEXT_COLS, COUNT_BEACON_CONTEXT_COLS]
+FIXED_BEACON_INTERVAL_S = 0.1
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -62,11 +65,12 @@ class TxPowerDeepc:
                 f"Expected output columns {OUTPUT_COLS}, got {self.summary['output_cols']}"
             )
         self.context_cols = list(self.summary.get("context_cols") or [])
-        if self.context_cols not in ([], CONTEXT_COLS):
+        if self.context_cols not in SUPPORTED_CONTEXT_COLS:
             raise ValueError(
-                f"Expected no context columns or {CONTEXT_COLS}, got {self.context_cols}"
+                f"Expected context columns in {SUPPORTED_CONTEXT_COLS}, got {self.context_cols}"
             )
-        self.use_context = self.context_cols == CONTEXT_COLS
+        self.use_context = bool(self.context_cols)
+        self.context_dim = len(self.context_cols)
         if self.summary["past_horizon_samples"] != 20:
             raise ValueError("Expected Tini=20")
         if self.summary["future_horizon_samples"] != 10:
@@ -91,8 +95,8 @@ class TxPowerDeepc:
             "Yf": self.yf.shape,
         }
         if self.use_context:
-            expected["Dp"] = (20, 307)
-            expected["Df"] = (10, 307)
+            expected["Dp"] = (20 * self.context_dim, 307)
+            expected["Df"] = (10 * self.context_dim, 307)
             actual["Dp"] = self.dp.shape
             actual["Df"] = self.df.shape
         if actual != expected:
@@ -104,11 +108,11 @@ class TxPowerDeepc:
         self.y_mean = np.array([self.scaler["mean"][name] for name in OUTPUT_COLS])
         self.y_std = np.array([self.scaler["std"][name] for name in OUTPUT_COLS])
         if self.use_context:
-            self.d_mean = self.scaler["mean"]["active_vehicle_count_core"]
-            self.d_std = self.scaler["std"]["active_vehicle_count_core"]
+            self.d_mean = np.array([self.scaler["mean"][name] for name in self.context_cols])
+            self.d_std = np.array([self.scaler["std"][name] for name in self.context_cols])
         else:
-            self.d_mean = 0.0
-            self.d_std = 1.0
+            self.d_mean = np.array([0.0])
+            self.d_std = np.array([1.0])
 
         n_columns = self.up.shape[1]
         self.g = cp.Variable(n_columns)
@@ -163,10 +167,26 @@ class TxPowerDeepc:
         return matrix * self.y_std + self.y_mean
 
     def normalize_d(self, values: np.ndarray) -> np.ndarray:
-        return (values - self.d_mean) / self.d_std
+        matrix = values.reshape(-1, self.context_dim)
+        return ((matrix - self.d_mean) / self.d_std).reshape(-1)
 
     def denormalize_d(self, values: np.ndarray) -> np.ndarray:
-        return values * self.d_std + self.d_mean
+        matrix = values.reshape(-1, self.context_dim)
+        return (matrix * self.d_std + self.d_mean).reshape(-1)
+
+    def build_future_context(self, d_ini: np.ndarray) -> np.ndarray:
+        history = d_ini.reshape(-1, self.context_dim)
+        future = np.tile(history[-1], (10, 1))
+        if "beacon_interval_s" in self.context_cols:
+            beacon_index = self.context_cols.index("beacon_interval_s")
+            future[:, beacon_index] = FIXED_BEACON_INTERVAL_S
+        return future.reshape(-1)
+
+    def context_forecast_column(self, d_future: list[float], name: str) -> list[float]:
+        if not d_future or name not in self.context_cols:
+            return []
+        matrix = np.asarray(d_future, dtype=float).reshape(-1, self.context_dim)
+        return matrix[:, self.context_cols.index(name)].tolist()
 
     def solve(self, request: dict) -> dict:
         previous_power = float(request["previous_u"][0])
@@ -192,16 +212,18 @@ class TxPowerDeepc:
             if u_ini.shape != (20,) or y_ini.shape != (60,):
                 raise ValueError(f"Bad history shapes: u_ini={u_ini.shape}, y_ini={y_ini.shape}")
             if self.use_context:
-                if request.get("context_cols") != CONTEXT_COLS:
+                if request.get("context_cols") != self.context_cols:
                     raise ValueError("Request context columns do not match the controller dataset")
                 if request.get("density_forecast_mode", "hold_last") != "hold_last":
                     raise ValueError("Only density_forecast_mode=hold_last is supported")
                 d_ini = np.asarray(request["d_ini"], dtype=float)
-                if d_ini.shape != (20,):
+                expected_d_shape = (20 * self.context_dim,)
+                if d_ini.shape != expected_d_shape:
                     raise ValueError(f"Bad density history shape: d_ini={d_ini.shape}")
-                d_future_physical = np.full(10, d_ini[-1], dtype=float).tolist()
+                d_future_array = self.build_future_context(d_ini)
+                d_future_physical = d_future_array.tolist()
                 self.d_ini.value = self.normalize_d(d_ini)
-                self.d_future.value = self.normalize_d(np.asarray(d_future_physical, dtype=float))
+                self.d_future.value = self.normalize_d(d_future_array)
 
             self.u_ini.value = self.normalize_u(u_ini)
             self.y_ini.value = self.normalize_y(y_ini)
@@ -275,7 +297,12 @@ class TxPowerDeepc:
             "max_dp_residual": max_dp_residual,
             "max_df_residual": max_df_residual,
             "density_forecast_mode": "hold_last" if self.use_context else "none",
-            "density_forecast_active_vehicle_count_core": d_future_physical,
+            "density_forecast_active_vehicle_count_core": self.context_forecast_column(
+                d_future_physical, "active_vehicle_count_core"
+            ),
+            "beacon_interval_forecast_s": self.context_forecast_column(
+                d_future_physical, "beacon_interval_s"
+            ),
             "error": error,
         }
         return response
@@ -312,6 +339,7 @@ def open_logs(bridge_dir: Path) -> tuple[csv.DictWriter, object, csv.DictWriter,
         "predicted_pir_s",
         "predicted_cbr",
         "forecast_active_vehicle_count_core",
+        "forecast_beacon_interval_s",
     ]
     predictions = csv.DictWriter(prediction_file, fieldnames=prediction_fields)
     predictions.writeheader()
@@ -376,6 +404,11 @@ def main() -> None:
                                 "forecast_active_vehicle_count_core": (
                                     response["density_forecast_active_vehicle_count_core"][index]
                                     if response["density_forecast_active_vehicle_count_core"]
+                                    else None
+                                ),
+                                "forecast_beacon_interval_s": (
+                                    response["beacon_interval_forecast_s"][index]
+                                    if response["beacon_interval_forecast_s"]
                                     else None
                                 ),
                             }

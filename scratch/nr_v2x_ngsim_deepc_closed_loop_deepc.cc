@@ -2143,10 +2143,11 @@ class DeepcFileBridge
     std::vector<double> BuildDIni() const
     {
         std::vector<double> values;
-        values.reserve(m_samples.size());
+        values.reserve(m_samples.size() * 2);
         for (const auto& sample : m_samples)
         {
             values.push_back(sample.activeVehicleCountCore);
+            values.push_back(sample.beaconIntervalS);
         }
         return values;
     }
@@ -2169,8 +2170,9 @@ class DeepcFileBridge
             << ",\n"
             << "  \"input_cols\": [\"tx_power_dbm\"],\n"
             << "  \"output_cols\": [\"prr_awareness\", \"pir_s\", \"cbr\"],\n"
-            << "  \"context_cols\": [\"active_vehicle_count_core\"],\n"
+            << "  \"context_cols\": [\"active_vehicle_count_core\", \"beacon_interval_s\"],\n"
             << "  \"density_forecast_mode\": \"hold_last\",\n"
+            << "  \"beacon_interval_forecast_mode\": \"fixed_0p1\",\n"
             << "  \"previous_u\": ";
         WriteJsonArray(out, {previousU.txPowerDbm});
         out << ",\n  \"u_ini\": ";
