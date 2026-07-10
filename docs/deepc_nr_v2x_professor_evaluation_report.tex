@@ -554,6 +554,35 @@ there is a documented folder contract, exact command scripts for major stages,
 and generated readiness reports that identify which claims are safe and which
 runs are still missing.
 
+\section{Code and Artifact Map}
+
+To make the implementation easier to inspect, Table~\ref{tab:code-map} maps
+the main reported claims to the script or artifact that supports them. The
+Python OSQP controller source has also been commented around the bridge
+protocol, signal validation, normalization, Hankel-block usage, optimization
+objective, constraints, diagnostics, and receding-horizon response path.
+
+\begin{longtable}{p{0.34\linewidth}p{0.59\linewidth}}
+\caption{Main implementation files and artifacts for professor review.}
+\label{tab:code-map}\\
+\toprule
+File or artifact & Role in the project \\
+\midrule
+\endfirsthead
+\toprule
+File or artifact & Role in the project \\
+\midrule
+\endhead
+\artifact{scripts/build_hankel_dataset.py} & Builds the cleaned \deePC{} dataset, train/validation/test splits, normalization metadata, and Hankel matrices. \\
+\artifact{scripts/open_loop_deepc_predict.py} & Runs the offline held-out data-window diagnostic reported in Table~\ref{tab:open-loop}. \\
+\artifact{scripts/deepc_osqp_file_controller.py} & Implements the Python CVXPY/OSQP \deePC{} controller used by the ns-3 file bridge in the closed-loop run. \\
+\artifact{scripts/aggregate_final_campaign.py} & Aggregates run-level KPI metrics, readiness status, paper tables, and comparison plots. \\
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/01_training/deepc_dataset_txpower_count_tb0p1_dt0p5_n10/} & Final Tx-power-only \deePC{} dataset used by the controller. \\
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/fixed_10hz/run_101/} & Preliminary fixed 10 Hz baseline run used for the current comparison. \\
+\artifact{data/output/final/ieee_250veh_deepc_campaign_01/02_runs/deepc_count_tb0p1_prr_only/run_931/} & Preliminary \deePC{} closed-loop run used for feasibility evidence. \\
+\bottomrule
+\end{longtable}
+
 \section{Results and Evidence}
 
 \subsection{Collected Input-Output Simulation Evidence}
