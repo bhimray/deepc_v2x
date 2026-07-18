@@ -1,0 +1,518 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true
+}
+
+\title{NR-V2X DeePC Simulation Debugging and Validation Checklist}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+
+This document gives a practical validation workflow for the NR-V2X closed-loop DeePC simulation. The goal is to make the simulation easier to debug, easier to reproduce, and easier to defend scientifically.
+
+The central rule is:
+
+\begin{quote}
+Do not start debugging with a full 300 s closed-loop run. Validate each layer independently using short tests first.
+\end{quote}
+
+\section{Fixed Scenario Definition}
+
+Before running any campaign, freeze one scenario and avoid changing parameters during debugging.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+Parameter & Recommended value \\
+\midrule
+Mobility CSV & \texttt{data/processed/ngsim\_us101\_mainline\_active20\_250\_densest\_600s.csv} \\
+Simulation time & 300 s for final runs \\
+Warmup / cooldown & 10 s / 10 s \\
+KPI sample time & 0.5 s \\
+KPI window & 1.0 s \\
+Control interval & 0.5 s \\
+Beacon interval & 0.1 s \\
+CAM generation & fixed periodic, ETSI CAM trigger disabled \\
+Dynamic active pool & enabled \\
+Physical UE pool size & 250 \\
+Awareness range & 200 m \\
+Controlled input & Tx power only \\
+Tx power bounds & 10--23 dBm \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Do not mix beacon-rate control and Tx-power control until the Tx-power-only pipeline is validated.
+
+\section{Recommended Campaign Folder}
+
+Do not overwrite old results. Use a new campaign folder for each clean restart:
+
+\begin{lstlisting}
+data/output/final/ieee_250veh_deepc_campaign_02/
+\end{lstlisting}
+
+Recommended structure:
+
+\begin{lstlisting}
+commands/
+01_training/
+02_baselines/
+03_closed_loop/
+04_analysis/
+logs/
+\end{lstlisting}
+
+\section{Layered Validation Workflow}
+
+Use the following order:
+
+\begin{enumerate}
+    \item validate mobility and active vehicle counts;
+    \item run a 10 s fixed-baseline smoke test;
+    \item run a 30 s fixed-baseline smoke test;
+    \item run a 30 s open-loop training smoke test;
+    \item build a small Hankel dataset to test the pipeline;
+    \item test the Python DeePC controller using a saved request;
+    \item run a 30 s closed-loop smoke test;
+    \item plot and validate the closed-loop smoke test;
+    \item run full 300 s fixed baseline;
+    \item run full 300 s open-loop training;
+    \item build final Hankel matrices;
+    \item run full 300 s closed-loop DeePC;
+    \item compare only matched time windows.
+\end{enumerate}
+
+\section{Validation-Only Test}
+
+Before running the radio simulation, run validation-only mode:
+
+\begin{lstlisting}[language=bash]
+./ns3 run "nr_v2x_ngsim_deepc_closed_loop_deepc \
+  --mobilityCsv=data/processed/ngsim_us101_mainline_active20_250_densest_600s.csv \
+  --simTime=300 \
+  --warmup=10 \
+  --cooldown=10 \
+  --sampleTime=0.5 \
+  --dynamicActivePool=true \
+  --physicalUePoolSize=250 \
+  --validateOnly=true"
+\end{lstlisting}
+
+Check:
+
+\begin{itemize}
+    \item logical vehicle count;
+    \item peak simultaneous active vehicles;
+    \item peak active core vehicles;
+    \item physical UE pool size;
+    \item evaluation time window.
+\end{itemize}
+
+If validation-only mode fails, do not run the radio simulation.
+
+\section{Required Files Per Run}
+
+Every run should save:
+
+\begin{itemize}
+    \item \texttt{command.txt};
+    \item \texttt{stdout.log};
+    \item \texttt{stderr.log};
+    \item \texttt{kpi\_timeseries.csv};
+    \item \texttt{kpi\_timeseries\_metadata.json};
+    \item \texttt{cbr\_timeseries.csv};
+    \item \texttt{plots/};
+    \item controller logs for closed-loop runs.
+\end{itemize}
+
+The command file is important because many simulation errors come from forgetting which flags were used.
+
+\section{Command Scripts}
+
+Use scripts instead of manual commands. Recommended command scripts:
+
+\begin{lstlisting}
+commands/00_validate.sh
+commands/01_fixed_10hz_smoke.sh
+commands/02_training_smoke.sh
+commands/03_build_hankel.sh
+commands/04_deepc_smoke.sh
+commands/05_fixed_10hz_full.sh
+commands/06_training_full.sh
+commands/07_deepc_full.sh
+commands/08_plot_all.sh
+\end{lstlisting}
+
+Manual commands are useful for debugging, but final campaign runs should be script-based.
+
+\section{Dynamic UE Pool Validation}
+
+For the dynamic physical-UE pool, log or verify:
+
+\begin{itemize}
+    \item active vehicle count;
+    \item active core vehicle count;
+    \item assigned vehicle count;
+    \item free pool count;
+    \item assignment count;
+    \item release count;
+    \item maximum pool usage.
+\end{itemize}
+
+Important invariant:
+
+\[
+N_{\mathrm{assigned}} + N_{\mathrm{free}} = N_{\mathrm{pool}}.
+\]
+
+Also check:
+
+\[
+N_{\mathrm{assigned}} \approx N_{\mathrm{active}},
+\]
+
+within the expected active-window logic.
+
+\section{Recommended Pool Assignment Log}
+
+Create or maintain a debug CSV:
+
+\begin{lstlisting}
+pool_assignments.csv
+\end{lstlisting}
+
+Recommended columns:
+
+\begin{lstlisting}
+time_s,event,vehicle_id,node_id,source_l2_id,free_pool_count,active_count
+\end{lstlisting}
+
+where event is one of:
+
+\begin{lstlisting}
+assign
+release
+\end{lstlisting}
+
+Check:
+
+\begin{itemize}
+    \item no logical vehicle is assigned twice;
+    \item no physical node is assigned to two vehicles at once;
+    \item a released node returns to the free pool;
+    \item source L2 ID is nonzero;
+    \item active source L2 IDs do not duplicate.
+\end{itemize}
+
+\section{CAM Application State Validation}
+
+When a logical vehicle is released:
+
+\begin{itemize}
+    \item CAM dissemination should stop;
+    \item the application should be marked unassigned;
+    \item the mobility model should park the node outside the road;
+    \item the VDP pointer should remain valid and should not dangle.
+\end{itemize}
+
+When a new logical vehicle is assigned:
+
+\begin{itemize}
+    \item the station ID should match the current logical vehicle ID;
+    \item the VDP should point to the current vehicle state;
+    \item CAM dissemination should restart;
+    \item stale state should not corrupt KPI accounting.
+\end{itemize}
+
+Useful debug log:
+
+\begin{lstlisting}
+time_s,node_id,event,old_vehicle_id,new_vehicle_id,cam_running
+\end{lstlisting}
+
+\section{KPI Sanity Checks}
+
+For every KPI CSV, check:
+
+\begin{align}
+0 &\leq \mathrm{PRR} \leq 1, \\
+0 &\leq \mathrm{CBR} \leq 1, \\
+\mathrm{PIR} &\geq 0, \\
+N_{\mathrm{success}} &\leq N_{\mathrm{eligible}}, \\
+N_{\mathrm{tx}} &\geq 0.
+\end{align}
+
+If any of these fail, the run should not be used.
+
+\section{Plot Early}
+
+After every smoke run, plot:
+
+\begin{itemize}
+    \item PRR vs time;
+    \item PIR vs time;
+    \item CBR vs time;
+    \item active vehicle count vs time;
+    \item Tx power vs time;
+    \item beacon interval vs time;
+    \item Tx count vs time;
+    \item eligible count vs time;
+    \item success count vs time.
+\end{itemize}
+
+Do not rely only on mean values. Mean values can hide timing bugs, density effects, and transient errors.
+
+\section{Hankel Dataset Validation}
+
+Before building Hankel matrices, verify:
+
+\begin{itemize}
+    \item no NaN values;
+    \item no infinite values;
+    \item uniform sample time of 0.5 s;
+    \item enough rows for the chosen horizons;
+    \item input variation is sufficient;
+    \item output variation is physically reasonable;
+    \item train/validation/test splits are time ordered.
+\end{itemize}
+
+For:
+
+\[
+T_{\mathrm{ini}} = 20,\qquad N=10,\qquad \Delta t=0.5~\mathrm{s},
+\]
+
+the minimum window length is:
+
+\[
+T_{\mathrm{ini}} + N = 30~\mathrm{samples}.
+\]
+
+In practice, hundreds of samples are needed.
+
+\section{Expected Hankel Dimensions}
+
+For one input:
+
+\[
+u = P_{\mathrm{tx}},
+\]
+
+three outputs:
+
+\[
+y = [\mathrm{PRR},\mathrm{PIR},\mathrm{CBR}]^\top,
+\]
+
+and one context signal:
+
+\[
+d = N_{\mathrm{active,core}},
+\]
+
+the Hankel dimensions should be:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+Block & Expected dimension \\
+\midrule
+$U_p$ & $20 \times M$ \\
+$U_f$ & $10 \times M$ \\
+$Y_p$ & $60 \times M$ \\
+$Y_f$ & $30 \times M$ \\
+$D_p$ & $20 \times M$ \\
+$D_f$ & $10 \times M$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+If the context has two columns:
+
+\[
+d = [N_{\mathrm{active,core}},T_b]^\top,
+\]
+
+then:
+
+\[
+D_p = 40 \times M,\qquad D_f = 20 \times M.
+\]
+
+\section{Python Controller Validation}
+
+Before connecting to ns-3, test the Python DeePC controller with a saved request.
+
+Check:
+
+\begin{itemize}
+    \item OSQP status is \texttt{optimal} or \texttt{optimal\_inaccurate};
+    \item Tx power is within $[10,23]$ dBm;
+    \item residuals are below $10^{-5}$;
+    \item prediction arrays have length 10;
+    \item there are no NaN values;
+    \item fallback behavior works if OSQP fails.
+\end{itemize}
+
+This isolates Python and optimization bugs from ns-3 simulation bugs.
+
+\section{Closed-Loop Controller Timing}
+
+For each closed-loop control step, log:
+
+\begin{itemize}
+    \item request time;
+    \item response time;
+    \item bridge wait time;
+    \item solver status;
+    \item solve time;
+    \item objective value;
+    \item equality residuals;
+    \item applied Tx power.
+\end{itemize}
+
+The controller should solve faster than the control interval:
+
+\[
+t_{\mathrm{solve}} < 0.5~\mathrm{s}.
+\]
+
+If solve time exceeds the control interval, the closed-loop timing is not realistic.
+
+\section{Fallback Rule}
+
+The closed-loop controller should not crash the simulation when the optimizer fails. Correct fallback behavior is:
+
+\begin{quote}
+If OSQP fails, returns non-finite values, or violates bounds, keep the previous Tx power, log the failure, and continue the simulation.
+\end{quote}
+
+This makes the simulation robust and easier to debug.
+
+\section{Matched-Window Comparison}
+
+Do not compare runs over different time intervals.
+
+If one run stops at 162 s and another completes 300 s, compare only the common interval:
+
+\[
+[t_{\min},t_{\max}] = [10,162]~\mathrm{s}
+\]
+
+or another explicitly matched evaluation window.
+
+This is necessary because vehicle density changes over time. Unmatched windows can give misleading mean PRR, PIR, and CBR.
+
+\section{Required Baselines}
+
+Minimum recommended baselines:
+
+\begin{itemize}
+    \item fixed 10 Hz, 20 dBm;
+    \item fixed 10 Hz, lower Tx power close to the DeePC mean;
+    \item fixed 5 Hz, 20 dBm;
+    \item open-loop PRBS training run;
+    \item closed-loop DeePC.
+\end{itemize}
+
+If DeePC reduces mean Tx power, it should be compared against a fixed lower-power baseline. Otherwise, the improvement claim is weak.
+
+\section{Recommended Tools}
+
+Use these tools routinely:
+
+\begin{lstlisting}[language=bash]
+rg
+git status --short
+git diff
+./ns3 build <target>
+./ns3 run "... --validateOnly=true"
+./v2x_env/bin/python -m py_compile scripts/*.py
+./v2x_env/bin/python scripts/plot_deepc_bridge_run.py <RUN_DIR>
+\end{lstlisting}
+
+For crashes:
+
+\begin{lstlisting}[language=bash]
+gdb --args build/scratch/ns3.42-nr_v2x_ngsim_deepc_closed_loop_deepc-default ...
+\end{lstlisting}
+
+For memory issues:
+
+\begin{lstlisting}[language=bash]
+valgrind --tool=memcheck ...
+\end{lstlisting}
+
+For runtime profiling:
+
+\begin{lstlisting}[language=bash]
+/usr/bin/time -v ./ns3 run "..."
+\end{lstlisting}
+
+\section{Git Practice}
+
+Before major source-code changes:
+
+\begin{lstlisting}[language=bash]
+git status --short
+git checkout -b campaign-02-clean
+\end{lstlisting}
+
+Do not mix unrelated changes in one branch. Keep these separate:
+
+\begin{itemize}
+    \item SCI identity modifications;
+    \item dynamic UE pool changes;
+    \item DeePC formulation changes;
+    \item plotting changes;
+    \item dataset-building changes.
+\end{itemize}
+
+\section{Bottom Line}
+
+The correct simulation strategy is:
+
+\begin{enumerate}
+    \item validate each layer independently;
+    \item use short smoke tests before full runs;
+    \item log every command and metadata file;
+    \item check dynamic-pool invariants;
+    \item test the controller before connecting it to ns-3;
+    \item compare only matched time windows;
+    \item change one assumption at a time.
+\end{enumerate}
+
+The most important debug artifacts are:
+
+\begin{itemize}
+    \item \texttt{pool\_assignments.csv};
+    \item \texttt{controller\_diagnostics.csv};
+    \item KPI sanity-check script;
+    \item matched-window analysis script;
+    \item \texttt{command.txt} for every run.
+\end{itemize}
+
+Following this workflow prevents long, expensive simulations from being wasted on configuration or accounting errors.
+
+\end{document}

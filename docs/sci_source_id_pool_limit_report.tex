@@ -1,0 +1,390 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true
+}
+
+\title{Physical UE Pool Limitation Caused by 8-bit NR Sidelink SCI Source ID}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Problem Summary}
+
+In the current NR-V2X ns-3 experiment driver, the number of simultaneously instantiated physical NR UE nodes is limited to 250:
+
+\begin{lstlisting}[language=C++]
+static constexpr uint32_t kMaxPhysicalUePoolSize = 250;
+\end{lstlisting}
+
+This limit is not caused by the number of logical NGSIM vehicles in the mobility file. The simulation can load more than 250 logical vehicles over the whole simulation time. The limitation applies to the number of physical NR UE nodes that can be active at the same time.
+
+The reason for this cap is the sidelink source Layer-2 identity used in the ns-3 NR sidelink SCI format-2 header. In the current model, the SCI format-2 source ID is represented on the wire as an 8-bit field. Therefore, the safe source-ID space is limited.
+
+The experiment assigns deterministic source L2 IDs as follows:
+
+\begin{lstlisting}[language=C++]
+const uint32_t sourceL2Id = 1 + (ueIndex % 254);
+\end{lstlisting}
+
+The code avoids source ID 0 and leaves 255 for the group or broadcast-style destination:
+
+\begin{lstlisting}[language=C++]
+uint32_t dstL2Id = 255;
+slInfo.m_dstL2Id = dstL2Id;
+\end{lstlisting}
+
+Therefore, the usable source L2 IDs are effectively:
+
+\[
+1,2,\ldots,254.
+\]
+
+The experiment conservatively caps the physical UE pool at 250 to avoid source-ID aliasing.
+
+\section{Why This Is Not a \texttt{uint16\_t} Vehicle Limit}
+
+The logical vehicle IDs used by the NGSIM mobility processing and KPI logging are not limited to 250. For example, the custom KPI packet tag stores the transmitting logical vehicle ID as a 32-bit value:
+
+\begin{lstlisting}[language=C++]
+uint32_t m_txVehicleId = std::numeric_limits<uint32_t>::max();
+\end{lstlisting}
+
+The dynamic pool maps logical vehicles to physical ns-3 nodes using 32-bit IDs:
+
+\begin{lstlisting}[language=C++]
+static std::map<uint32_t, uint32_t> g_vehicleIdToNodeId;
+static std::map<uint32_t, uint32_t> g_nodeIdToVehicleId;
+\end{lstlisting}
+
+Thus, the limitation is not the logical vehicle identifier. The limitation comes from the sidelink SCI source identity transmitted by the NR MAC/PHY model.
+
+\section{Current SCI Format-2 Source-ID Encoding}
+
+The relevant file is:
+
+\begin{lstlisting}
+contrib/nr/model/nr-sl-sci-f2-header.h
+\end{lstlisting}
+
+The current header comment states:
+
+\begin{lstlisting}[language=C++]
+// m_srcId [8 bits]
+// m_dstId [16 bits]
+\end{lstlisting}
+
+The corresponding getter also returns an 8-bit value:
+
+\begin{lstlisting}[language=C++]
+uint8_t GetSrcId() const;
+\end{lstlisting}
+
+The serialization in:
+
+\begin{lstlisting}
+contrib/nr/model/nr-sl-sci-f2-header.cc
+\end{lstlisting}
+
+packs the source ID using only the lower 8 bits:
+
+\begin{lstlisting}[language=C++]
+scif2 = (m_srcId & 0xFF) | (scif2 << 8);
+scif2 = (m_dstId & 0xFFFF) | (scif2 << 16);
+\end{lstlisting}
+
+The deserialization also extracts only 8 bits:
+
+\begin{lstlisting}[language=C++]
+m_srcId = (scif2 >> 17) & 0xFF;
+m_dstId = (scif2 >> 1) & 0xFFFF;
+\end{lstlisting}
+
+This means that even if a larger \texttt{uint32\_t} source L2 ID is assigned internally, only the lower 8 bits are transmitted in the SCI header. Source IDs above 255 will alias with lower IDs.
+
+For example:
+
+\[
+256 \bmod 256 = 0,
+\qquad
+257 \bmod 256 = 1.
+\]
+
+Therefore, two different UEs may appear to have the same source L2 ID at the receiver.
+
+\section{Why Removing the Cap Alone Is Not Safe}
+
+If the following cap is simply removed:
+
+\begin{lstlisting}[language=C++]
+static constexpr uint32_t kMaxPhysicalUePoolSize = 250;
+\end{lstlisting}
+
+but the SCI source ID remains 8-bit, then the experiment will create more physical UEs, but their SCI source IDs will wrap.
+
+This causes source-ID aliasing:
+
+\begin{itemize}
+    \item different physical UEs may share the same SCI source ID;
+    \item receiver-side MAC/RLC/RRC state may confuse packets from different UEs;
+    \item sidelink bearer lookup may become ambiguous;
+    \item HARQ or scheduling state may be associated with the wrong source;
+    \item packet-level KPI interpretation may become scientifically unreliable.
+\end{itemize}
+
+Therefore, removing the pool cap without changing SCI identity handling is not a clean solution.
+
+\section{Proposed Solution: Extend SCI Source ID to 16 Bits}
+
+If the goal is to support more than 250 simultaneous physical UEs, one practical simulation solution is to extend the SCI format-2 source ID from 8 bits to 16 bits.
+
+Conceptually, the current model is:
+
+\[
+\text{srcId}=8\text{ bits},
+\qquad
+\text{dstId}=16\text{ bits}.
+\]
+
+The proposed model extension is:
+
+\[
+\text{srcId}=16\text{ bits},
+\qquad
+\text{dstId}=16\text{ bits}.
+\]
+
+This would allow a safe source-ID range of approximately:
+
+\[
+1,2,\ldots,65534,
+\]
+
+assuming 0 is avoided and 65535 is reserved or avoided if needed.
+
+\section{Implementation Changes Required}
+
+\subsection{Change SCI F2 Header Documentation and Getter}
+
+In:
+
+\begin{lstlisting}
+contrib/nr/model/nr-sl-sci-f2-header.h
+\end{lstlisting}
+
+the source-ID field description should be changed from:
+
+\begin{lstlisting}[language=C++]
+// m_srcId [8 bits]
+\end{lstlisting}
+
+to:
+
+\begin{lstlisting}[language=C++]
+// m_srcId [16 bits]
+\end{lstlisting}
+
+The getter should also be changed from:
+
+\begin{lstlisting}[language=C++]
+uint8_t GetSrcId() const;
+\end{lstlisting}
+
+to:
+
+\begin{lstlisting}[language=C++]
+uint16_t GetSrcId() const;
+\end{lstlisting}
+
+\subsection{Increase Serialized Header Size}
+
+The current SCI F2 header size is:
+
+\begin{lstlisting}[language=C++]
+uint32_t NrSlSciF2Header::GetSerializedSize() const
+{
+    return 4;
+}
+\end{lstlisting}
+
+Four bytes are not enough for a 16-bit source ID plus a 16-bit destination ID and the remaining HARQ, NDI, RV, and HARQ feedback fields. The serialized size must be increased, for example to 5 bytes.
+
+\subsection{Update Serialization and Deserialization}
+
+The current serialization truncates the source ID to 8 bits:
+
+\begin{lstlisting}[language=C++]
+scif2 = (m_srcId & 0xFF) | (scif2 << 8);
+\end{lstlisting}
+
+This must be replaced by a packing format that preserves 16 bits:
+
+\begin{lstlisting}[language=C++]
+// conceptually:
+// write harqId, ndi, rv, srcId[15:0], dstId[15:0], harqFbIndicator
+\end{lstlisting}
+
+The corresponding deserialization must recover the same 16-bit source ID:
+
+\begin{lstlisting}[language=C++]
+// conceptually:
+// m_srcId = extracted 16-bit source ID
+// m_dstId = extracted 16-bit destination ID
+\end{lstlisting}
+
+\subsection{Check SCI F2A Header Size}
+
+The SCI F2A header currently uses:
+
+\begin{lstlisting}[language=C++]
+return NrSlSciF2Header::GetSerializedSize() + 1;
+\end{lstlisting}
+
+If the base SCI F2 header changes from 4 bytes to 5 bytes, then the SCI F2A serialized size becomes 6 bytes. Any tests or assumptions expecting the old size must be updated.
+
+\subsection{Remove Modulo-Based Source-ID Assignment}
+
+In:
+
+\begin{lstlisting}
+scratch/nr_v2x_ngsim_deepc_closed_loop_deepc.cc
+scratch/nr_v2x_ngsim_deepc_data_set_generation.cc
+\end{lstlisting}
+
+the current assignment:
+
+\begin{lstlisting}[language=C++]
+const uint32_t sourceL2Id = 1 + (ueIndex % 254);
+\end{lstlisting}
+
+should be replaced by unique assignment:
+
+\begin{lstlisting}[language=C++]
+const uint32_t sourceL2Id = 1 + ueIndex;
+NS_ABORT_MSG_IF(sourceL2Id > 65534,
+                "sourceL2Id exceeds 16-bit safe range");
+\end{lstlisting}
+
+The modulo operation must not remain, because modulo assignment is what causes ID reuse.
+
+\subsection{Raise or Remove the Physical UE Pool Cap}
+
+The current cap:
+
+\begin{lstlisting}[language=C++]
+static constexpr uint32_t kMaxPhysicalUePoolSize = 250;
+\end{lstlisting}
+
+can then be changed to a larger value:
+
+\begin{lstlisting}[language=C++]
+static constexpr uint32_t kMaxPhysicalUePoolSize = 65534;
+\end{lstlisting}
+
+or replaced by a configurable validation based on the selected identity size.
+
+\section{Limitations of the 16-bit SCI Source-ID Solution}
+
+\subsection{It Is a Model Extension}
+
+The current ns-3 NR model explicitly documents the SCI F2 source ID as 8 bits. Extending it to 16 bits changes the modeled SCI format.
+
+Therefore, this solution should be described as a simulation extension, not as an unmodified standard-compliant NR SCI format.
+
+A defensible statement is:
+
+\begin{quote}
+We extended the ns-3 SCI format-2 source-ID field from 8 bits to 16 bits to support large simultaneous-UE experiments without L2 source-ID aliasing.
+\end{quote}
+
+\subsection{It Requires Consistent Changes Across the Stack}
+
+The source L2 ID is used in multiple layers:
+
+\begin{itemize}
+    \item SCI F2 serialization and deserialization;
+    \item NR UE MAC packet processing;
+    \item sidelink logical channel identifiers;
+    \item RLC and PDCP sidelink parameters;
+    \item RRC sidelink bearer lookup;
+    \item statistics tracing.
+\end{itemize}
+
+Many internal structures already use \texttt{uint32\_t} for source L2 IDs, so the main bottleneck is the SCI wire encoding. However, the change must still be tested carefully.
+
+\subsection{It May Affect Comparability}
+
+If results are compared against standard NR-V2X behavior, the modification must be disclosed. The larger source-ID field may not correspond exactly to the original SCI bit allocation.
+
+This does not make the simulation useless, but it changes the interpretation:
+
+\begin{itemize}
+    \item with 8-bit SCI source ID, the simulation is closer to the current ns-3 model;
+    \item with 16-bit SCI source ID, the simulation is better for large-scale experiments but uses an extended identity representation.
+\end{itemize}
+
+\subsection{It Does Not Solve Runtime Cost}
+
+Removing the 250-UE cap does not remove computational cost. Creating 400 or more simultaneous physical NR UEs will increase:
+
+\begin{itemize}
+    \item memory usage;
+    \item PHY/MAC event count;
+    \item sidelink sensing complexity;
+    \item simulation runtime;
+    \item output trace size.
+\end{itemize}
+
+Therefore, even with 16-bit source IDs, the simulation may become very slow.
+
+\section{Alternative Solutions}
+
+\subsection{Keep Dynamic Active Pool Below 250}
+
+This is the safest solution with the current model. Logical vehicles can exceed 250 over the full simulation, but simultaneous physical UEs remain below 250.
+
+This is suitable when:
+
+\[
+\text{peak simultaneous active vehicles} \leq 250.
+\]
+
+\subsection{Use Timed 8-bit ID Reuse}
+
+Another option is to reuse 8-bit source IDs only after a safe timeout and after receiver-side bearer cleanup. This is more standards-compatible than changing SCI size, but it is complex and requires careful cleanup of receiver state.
+
+\subsection{Full Identity Reconstruction}
+
+The most scientifically complete option is to keep the SCI field as 8 bits and reconstruct the remaining identity through the MAC PDU, RLC, or application metadata path.
+
+This avoids changing the SCI field size, but it requires a deeper model change.
+
+\section{Conclusion}
+
+The current 250 physical-UE cap is not a general ns-3 vehicle limit and not a logical NGSIM vehicle limit. It exists because the current ns-3 NR sidelink SCI format-2 source ID is encoded as an 8-bit field, while source ID 0 is avoided and 255 is used as the group destination.
+
+Therefore, the current safe source-ID space is approximately:
+
+\[
+1,\ldots,254.
+\]
+
+If more than 250 simultaneous physical UEs are required, simply removing the pool cap is not safe. It would cause source-ID aliasing.
+
+The practical solution is to extend the SCI source ID to 16 bits, remove modulo-based source-ID assignment, and raise the physical UE pool cap. However, this must be documented as an ns-3 model extension and validated carefully because it changes the SCI identity representation.
+
+\end{document}

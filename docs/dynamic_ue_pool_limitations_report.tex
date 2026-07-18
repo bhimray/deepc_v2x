@@ -1,0 +1,309 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true
+}
+
+\title{Limitations of Using a Dynamic 250-UE Pool for NGSIM NR-V2X Simulation}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Problem Summary}
+
+The NR-V2X simulation uses a dynamic physical-UE pool instead of creating one physical NR UE for every logical NGSIM vehicle. In this approach, a logical vehicle is assigned to a physical NR UE only while it is active in the selected simulation window. When the vehicle leaves the active window, the physical UE is released and may later be assigned to a different logical vehicle.
+
+The method can be summarized as:
+
+\begin{enumerate}
+    \item a logical NGSIM vehicle enters the active window;
+    \item the simulation assigns it to one physical NR UE;
+    \item the physical UE provides PHY, MAC, RRC, mobility, and CAM application behavior;
+    \item the logical vehicle exits the active window;
+    \item the physical UE is released;
+    \item the same physical UE may later be reassigned to another logical vehicle.
+\end{enumerate}
+
+This design allows the simulation to use many logical vehicles over the full simulation time while keeping the number of simultaneous physical NR UEs below the safe source-L2-ID range.
+
+\section{Reason for Using the UE Pool}
+
+The processed NGSIM mobility file may contain hundreds of logical vehicles over the whole simulation. However, not all of these vehicles are active at the same time. Therefore, creating one physical NR UE per logical vehicle is computationally expensive and may also exceed the safe source-L2-ID range in the current ns-3 NR sidelink model.
+
+The dynamic pool solves this by creating a bounded number of physical UEs:
+
+\[
+N_{\mathrm{UE,pool}} = 250.
+\]
+
+As long as the peak number of simultaneously active logical vehicles is below the pool size, every active vehicle can still be assigned to a physical UE.
+
+For example:
+
+\[
+N_{\mathrm{active,peak}} \approx 179 < 250.
+\]
+
+Thus, the dynamic pool is sufficient for the current NGSIM scenario.
+
+\section{Main Disadvantage}
+
+The main disadvantage is that the physical NR UE object is reused for different logical vehicles over time. This means the new logical vehicle may inherit radio state from the previous logical vehicle unless that state is explicitly cleared.
+
+In simple terms:
+
+\begin{quote}
+The new vehicle may not start as a fresh vehicle. It may start with leftover PHY/MAC/RRC state from the previous vehicle assigned to the same physical UE.
+\end{quote}
+
+This is the most important scientific limitation of the dynamic UE pool.
+
+\section{Persistent MAC/RRC State}
+
+When a physical UE is released and reassigned, the ns-3 node and NR device are not destroyed and recreated. The same physical UE object remains alive.
+
+Therefore, internal state may persist, including:
+
+\begin{itemize}
+    \item sidelink resource reservations;
+    \item resource reselection counters;
+    \item HARQ buffers;
+    \item RLC and PDCP state;
+    \item MAC logical-channel state;
+    \item sensing history;
+    \item destination L2 state;
+    \item scheduler grants.
+\end{itemize}
+
+If these states are not reset during reassignment, the behavior of the new logical vehicle may be affected by the previous logical vehicle.
+
+\section{Resource Reservation Carryover}
+
+NR sidelink Mode 2 uses sensing-based resource selection and semi-persistent behavior. A UE may keep or reselect resources based on previous sensing and scheduling state.
+
+If a physical UE had already selected or reserved resources, then after reassignment the newly assigned logical vehicle may continue with resource-selection state that belongs to the previous vehicle.
+
+This can affect:
+
+\begin{itemize}
+    \item channel busy ratio (CBR);
+    \item packet reception ratio (PRR);
+    \item packet inter-reception time (PIR);
+    \item collision behavior;
+    \item sidelink scheduler behavior.
+\end{itemize}
+
+Therefore, the dynamic pool may introduce a bias if old resource-selection state is not cleared.
+
+\section{Sensing History Carryover}
+
+Sensing history is another important issue. A physical UE may have accumulated sensing observations at its previous assigned vehicle location. When the same physical UE is reassigned to a new logical vehicle, the sensing history may not correspond to the new vehicle's environment.
+
+This is important because sensing-based resource selection depends on recent channel observations. Therefore, the new logical vehicle may make resource decisions based on:
+
+\[
+\text{old sensing history from the previous vehicle}
+\]
+
+instead of:
+
+\[
+\text{fresh sensing history at the new vehicle location}.
+\]
+
+This can make the reassigned UE behavior less physically realistic.
+
+\section{Identity Reuse}
+
+Even if source L2 IDs are unique among the physical UEs, the same physical UE keeps its source L2 ID when it is reassigned.
+
+For example:
+
+\[
+\text{vehicle A} \rightarrow \text{physical UE 10} \rightarrow \text{sourceL2Id}=10,
+\]
+
+then vehicle A exits, and later:
+
+\[
+\text{vehicle B} \rightarrow \text{physical UE 10} \rightarrow \text{sourceL2Id}=10.
+\]
+
+Thus, over time, different logical vehicles may use the same source L2 ID.
+
+If receiver-side state for that source L2 ID is not cleared, receivers may treat the new vehicle as a continuation of the old vehicle.
+
+This can affect:
+
+\begin{itemize}
+    \item RLC bearer lookup;
+    \item receiver-side state;
+    \item HARQ state;
+    \item packet classification;
+    \item statistics interpretation.
+\end{itemize}
+
+\section{Packet and KPI Accounting Risk}
+
+The simulation uses logical vehicle IDs in packet tags to improve KPI accounting. This helps separate logical vehicle identity from physical UE identity.
+
+However, stale packets can still be a risk. For example:
+
+\begin{enumerate}
+    \item old vehicle transmits a packet;
+    \item old vehicle leaves the active window;
+    \item the physical UE is reassigned to a new vehicle;
+    \item the old packet arrives late.
+\end{enumerate}
+
+If the filtering logic is not careful, the packet may be counted under the wrong assignment or may affect receiver state unexpectedly.
+
+The current code attempts to reduce this risk using logical vehicle IDs and assignment checks, but this remains an important validation point.
+
+\section{Difference from One-UE-Per-Vehicle Simulation}
+
+The most literal simulation model would be:
+
+\[
+\text{one logical vehicle} = \text{one physical NR UE}.
+\]
+
+In the real world, each vehicle has its own radio hardware and persistent radio identity. A vehicle's radio state is not reused by another vehicle.
+
+The dynamic pool is different:
+
+\[
+\text{many logical vehicles over time} \rightarrow \text{smaller reused physical UE pool}.
+\]
+
+This is computationally efficient, but less physically literal.
+
+\section{Possible Hidden-Node or Background-Load Effects}
+
+The dynamic pool usually instantiates only vehicles that are active in the selected window. If vehicles outside the active region are not instantiated, they may not contribute to:
+
+\begin{itemize}
+    \item interference;
+    \item channel occupancy;
+    \item hidden-node effects;
+    \item sensing history;
+    \item background CBR.
+\end{itemize}
+
+This is acceptable if inactive vehicles are truly outside the communication or interference range. However, if the active window is too narrow, the simulation may underestimate background channel load.
+
+\section{Methodological Complexity}
+
+Using a dynamic UE pool adds methodological complexity. A paper or report must explain:
+
+\begin{itemize}
+    \item why physical UE pooling was used;
+    \item how logical vehicles are assigned to physical UEs;
+    \item how vehicles are released;
+    \item why the pool size is sufficient;
+    \item how stale packets are filtered;
+    \item what PHY/MAC/RRC state may remain;
+    \item what limitations this introduces.
+\end{itemize}
+
+This is more complex than the simpler statement:
+
+\begin{quote}
+One physical NR UE was created for each logical vehicle.
+\end{quote}
+
+However, the dynamic pool is practical for large mobility traces where the number of logical vehicles over time is much larger than the number of simultaneously active vehicles.
+
+\section{Practical Assessment for the Current Scenario}
+
+For the current NGSIM scenario, the dynamic UE pool is likely acceptable as a first study because:
+
+\[
+N_{\mathrm{active,peak}} \approx 179,
+\qquad
+N_{\mathrm{UE,pool}} = 250.
+\]
+
+Therefore, the pool has enough physical UEs to cover all simultaneously active vehicles. Also, the rate of vehicle assignment and release is relatively small compared to the total number of active vehicles.
+
+However, the limitation remains:
+
+\begin{quote}
+The physical UE radio state may survive across different logical vehicles.
+\end{quote}
+
+This is the key point that should be documented.
+
+\section{Possible Mitigations}
+
+\subsection{Reset State on Reassignment}
+
+The strongest mitigation while keeping the UE pool is to explicitly reset relevant NR state when a physical UE is released and reassigned.
+
+This may include:
+
+\begin{itemize}
+    \item clearing sidelink resource reservations;
+    \item clearing reselection counters;
+    \item clearing HARQ buffers;
+    \item clearing RLC/PDCP state;
+    \item clearing sensing history;
+    \item clearing receiver bearer state if source IDs are reused.
+\end{itemize}
+
+This is technically more difficult but improves scientific credibility.
+
+\subsection{Use One Physical UE per Logical Vehicle}
+
+The cleanest modeling solution is to instantiate one physical NR UE for every logical vehicle. This avoids reassignment and persistent-state carryover.
+
+However, this approach increases:
+
+\begin{itemize}
+    \item memory usage;
+    \item simulation runtime;
+    \item PHY/MAC event count;
+    \item source-L2-ID requirements.
+\end{itemize}
+
+It may also require solving the SCI source-ID limitation if more than 250 UEs are active or instantiated.
+
+\subsection{Document the Dynamic Pool as a Simulation Approximation}
+
+If the dynamic pool is retained, it should be clearly documented as a simulation approximation.
+
+A defensible statement is:
+
+\begin{quote}
+To reduce computational cost and avoid the 8-bit SCI source-ID limit, the simulation uses a dynamic physical-UE pool. Each active logical NGSIM vehicle is assigned to one physical NR UE while it is inside the active window. When the vehicle exits, the UE is released and may later be assigned to another logical vehicle. This enables many logical vehicles over time while keeping the number of simultaneous physical UEs below the safe L2-ID range. The limitation is that PHY/MAC/RRC state may persist across reassignment unless explicitly reset, so resource-selection and sensing state may not be completely vehicle-independent.
+\end{quote}
+
+\section{Conclusion}
+
+The dynamic 250-UE pool is a practical method for simulating large NGSIM mobility traces without creating one NR UE for every logical vehicle. It is appropriate when the peak number of simultaneously active vehicles is below the pool size.
+
+The main disadvantage is that physical UE state may persist across logical vehicle reassignment. This can affect sidelink resource selection, sensing history, receiver state, and KPI interpretation.
+
+Therefore, the dynamic pool is acceptable for a first study if it is clearly documented and validated. For a stronger final paper, the best options are:
+
+\begin{enumerate}
+    \item explicitly reset MAC/RRC/scheduler state during reassignment;
+    \item create one physical UE per logical vehicle;
+    \item retain the pool but document it as a simulation approximation and report the reassignment rate.
+\end{enumerate}
+
+\end{document}
