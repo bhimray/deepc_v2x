@@ -1,0 +1,797 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstdefinestyle{cppstyle}{
+    language=C++,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue!70!black},
+    commentstyle=\color{green!40!black},
+    stringstyle=\color{red!60!black},
+    breaklines=true,
+    frame=single,
+    columns=fullflexible
+}
+
+\title{Explanation of the ns-3 NR-V2X NGSIM DeePC Code Flow}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Overview}
+
+The file \texttt{nr\_v2x\_ngsim\_deepc\_data\_set\_generation.cc} is an ns-3 scratch simulation program used to generate open-loop NR-V2X data from NGSIM vehicle mobility traces. The generated data is intended for later use in DeePC, meaning Data-enabled Predictive Control.
+
+Although the filename contains \texttt{deepc}, this file does not run a closed-loop DeePC controller. Instead, it generates input-output data by simulating vehicles that transmit CAM messages over NR sidelink while the transmission power and beacon interval are varied according to an input schedule.
+
+This document keeps that original open-loop dataset-generation explanation as the base code-flow description. Additional notes near the end describe how the newer closed-loop files change the flow:
+
+\begin{itemize}
+    \item \texttt{scratch/nr\_v2x\_ngsim\_deepc\_closed\_loop\_deepc.cc},
+    \item \texttt{scripts/deepc\_osqp\_file\_controller.py}.
+\end{itemize}
+
+In the newer closed-loop runner, the main change is that the PRBS input schedule is disabled, CAM generation stays fixed at \(0.1\,\mathrm{s}\), and a Python OSQP DeePC controller adapts only the transmit power through a JSON file bridge.
+
+The main purpose of the code is to produce time-series data such as:
+\begin{itemize}
+    \item transmit power,
+    \item beacon interval,
+    \item packet reception ratio,
+    \item packet inter-reception time,
+    \item channel busy ratio,
+    \item sensing exclusion ratio,
+    \item vehicle density,
+    \item neighbor counts.
+\end{itemize}
+
+These outputs are written to CSV files and can later be used for DeePC identification, training, or evaluation.
+
+\section{Main Simulation Inputs}
+
+The simulation uses two important input CSV files.
+
+\subsection{Mobility CSV}
+
+The mobility CSV contains NGSIM vehicle trajectories. Each row contains information similar to:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Column & Meaning \\
+\midrule
+\texttt{time\_s} & Simulation time in seconds \\
+\texttt{vehicle\_id} & Vehicle identifier \\
+\texttt{x\_m} & Vehicle x-position in meters \\
+\texttt{y\_m} & Vehicle y-position in meters \\
+\texttt{vx\_mps} & x velocity in m/s \\
+\texttt{vy\_mps} & y velocity in m/s \\
+\texttt{speed\_mps} & Speed in m/s \\
+\texttt{lane\_id} & Lane identifier \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The function \texttt{LoadMobilityCsv()} loads this file and stores the trajectory of each vehicle.
+
+\subsection{Input Schedule CSV}
+
+The input schedule contains open-loop control inputs:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Column & Meaning \\
+\midrule
+\texttt{time\_s} & Time at which input is applied \\
+\texttt{tx\_power\_dbm} & Transmit power in dBm \\
+\texttt{beacon\_interval\_s} & CAM beacon interval in seconds \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These inputs are typically generated as a PRBS signal. The input vector can be written as:
+
+\begin{equation}
+u(t) =
+\begin{bmatrix}
+P_{\mathrm{tx}}(t) \\
+T_b(t)
+\end{bmatrix},
+\end{equation}
+
+where \(P_{\mathrm{tx}}\) is the transmit power and \(T_b\) is the beacon interval.
+
+\section{Simulation Setup}
+
+Before \texttt{Simulator::Run()} is called, the program performs all scenario setup.
+
+\subsection{Loading Data}
+
+First, the mobility data is loaded:
+
+\begin{lstlisting}[style=cppstyle]
+LoadMobilityCsv(mobilityCsv);
+\end{lstlisting}
+
+If input scheduling is enabled, the PRBS schedule is also loaded:
+
+\begin{lstlisting}[style=cppstyle]
+if (useInputSchedule)
+{
+    LoadInputScheduleCsv(inputCsv);
+}
+\end{lstlisting}
+
+\subsection{Creating Vehicle Nodes}
+
+The code creates one ns-3 node for each selected vehicle:
+
+\begin{lstlisting}[style=cppstyle]
+NodeContainer allSlUesContainer;
+allSlUesContainer.Create(vehicleIds.size());
+\end{lstlisting}
+
+Each node corresponds to one vehicle. The NGSIM trajectory is installed as waypoint mobility:
+
+\begin{lstlisting}[style=cppstyle]
+InstallWaypointMobility(node, g_mobilityByVehicle[vehicleId]);
+\end{lstlisting}
+
+The mobility model allows ns-3 to compute the position of each vehicle at any simulation time.
+
+\subsection{Inactive Vehicles}
+
+If a vehicle is not active at a certain time, it is moved far away to an inactive parking position:
+
+\begin{equation}
+(x,y) \approx (-10000, -10000).
+\end{equation}
+
+This prevents vehicles outside their valid mobility time range from affecting the evaluated region.
+
+\section{NR-V2X Sidelink Configuration}
+
+The code configures NR sidelink communication at 5.9 GHz. Important parameters include:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Parameter & Default Value \\
+\midrule
+Carrier frequency & \(5.9\,\mathrm{GHz}\) \\
+Bandwidth & \(10\,\mathrm{MHz}\) \\
+MCS & 6 \\
+Sensing & Enabled \\
+HARQ & Enabled \\
+Reservation period & \(100\,\mathrm{ms}\) \\
+Simulation time & \(600\,\mathrm{s}\) \\
+Maximum vehicles & 250 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The NR sidelink stack handles:
+\begin{itemize}
+    \item sidelink resource selection,
+    \item sensing,
+    \item MAC scheduling,
+    \item PHY transmission,
+    \item channel propagation,
+    \item pathloss and shadowing,
+    \item packet decoding and reception.
+\end{itemize}
+
+\section{CAM Application}
+
+Each vehicle runs a custom application called \texttt{CamApplication}. This application generates and receives ETSI CAM messages.
+
+The CAM application uses:
+\begin{itemize}
+    \item \texttt{CABasicService},
+    \item \texttt{GeoNet},
+    \item \texttt{btp},
+    \item \texttt{NgsimVehicleDataProvider}.
+\end{itemize}
+
+The \texttt{NgsimVehicleDataProvider} provides CAM fields such as:
+\begin{itemize}
+    \item position,
+    \item speed,
+    \item heading,
+    \item acceleration,
+    \item vehicle size.
+\end{itemize}
+
+These values are obtained from the ns-3 mobility model.
+
+\section{Packet Tagging}
+
+Each transmitted CAM packet is tagged with a custom \texttt{KpiPacketTag}. This tag stores:
+
+\begin{itemize}
+    \item a sequence number,
+    \item the transmission timestamp.
+\end{itemize}
+
+The tag is added in:
+
+\begin{lstlisting}[style=cppstyle]
+CamApplication::TagAndLogTx()
+\end{lstlisting}
+
+The tag allows the receiver to calculate packet delay and identify which transmitted packet was successfully received.
+
+\section{KPI Logger}
+
+The \texttt{KpiLogger} class collects packet-level events and computes time-windowed KPIs.
+
+\subsection{Transmit Logging}
+
+When a CAM is transmitted, \texttt{LogTx()} is called. It records:
+
+\begin{itemize}
+    \item transmission time,
+    \item transmitter node ID,
+    \item sequence number,
+    \item transmitter position,
+    \item number of eligible receivers,
+    \item eligible receivers by distance bin.
+\end{itemize}
+
+A receiver is considered eligible if it is active, inside the core region, and within the awareness range.
+
+\subsection{Receive Logging}
+
+When a CAM is received, \texttt{LogRx()} records:
+
+\begin{itemize}
+    \item reception time,
+    \item transmitter node ID,
+    \item receiver node ID,
+    \item sequence number,
+    \item transmitter and receiver positions,
+    \item distance at transmission time,
+    \item packet delay,
+    \item packet inter-reception time.
+\end{itemize}
+
+\section{Output Metrics}
+
+The main output file contains columns:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Metric & Meaning \\
+\midrule
+\texttt{time\_s} & Simulation timestamp \\
+\texttt{tx\_power\_dbm} & Current transmit power \\
+\texttt{beacon\_interval\_s} & Current beacon interval \\
+\texttt{active\_vehicle\_count\_core} & Vehicles active in the core region \\
+\texttt{density\_veh\_per\_km\_core} & Vehicle density in vehicles/km \\
+\texttt{mean\_neighbors\_150m} & Mean number of neighbors within 150 m \\
+\texttt{mean\_neighbors\_300m} & Mean number of neighbors within 300 m \\
+\texttt{prr\_awareness} & Packet reception ratio \\
+\texttt{pir\_s} & Packet inter-reception time \\
+\texttt{cbr} & Channel busy ratio \\
+\texttt{sensing\_exclusion\_ratio} & Sensing-based resource exclusion ratio \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Packet Reception Ratio}
+
+The packet reception ratio is calculated as:
+
+\begin{equation}
+\mathrm{PRR} =
+\frac{
+N_{\mathrm{rx,success}}
+}{
+N_{\mathrm{tx,eligible}}
+},
+\end{equation}
+
+where \(N_{\mathrm{rx,success}}\) is the number of unique successful transmitter-receiver-sequence receptions, and \(N_{\mathrm{tx,eligible}}\) is the number of eligible receiver opportunities.
+
+Eligibility depends on:
+\begin{itemize}
+    \item receiver activity,
+    \item receiver being inside the core region,
+    \item receiver being within the awareness range,
+    \item transmitter being inside the evaluation window.
+\end{itemize}
+
+\section{Packet Inter-Reception Time}
+
+The packet inter-reception time, PIR, is computed per transmitter-receiver pair:
+
+\begin{equation}
+\mathrm{PIR}_{i,j}(k) =
+t_{\mathrm{rx},i,j}(k) -
+t_{\mathrm{rx},i,j}(k-1),
+\end{equation}
+
+where \(i\) is the transmitter, \(j\) is the receiver, and \(k\) is the received packet index.
+
+The output value is the average PIR over recent received packets inside the KPI window.
+
+\section{CBR and Sidelink Sensing}
+
+The code connects two trace sources to the \texttt{CbrLogger}:
+
+\begin{lstlisting}[style=cppstyle]
+Config::Connect(
+    "/NodeList/*/DeviceList/*/ComponentCarrierMapUe/*/NrUeMac/SensingAlgorithm",
+    MakeCallback(&CbrLogger::RecordSensingAlgorithm, cbrLogger));
+
+Config::Connect(
+    "/NodeList/*/DeviceList/*/ComponentCarrierMapUe/*/NrUePhy/NrSpectrumPhy/ChannelOccupied",
+    MakeCallback(&CbrLogger::RecordChannelOccupied, cbrLogger));
+\end{lstlisting}
+
+These two traces are used differently.
+
+\subsection{Channel Busy Ratio}
+
+The CBR output is primarily computed from the PHY \texttt{ChannelOccupied} trace. This trace records busy time intervals at the PHY layer.
+
+The CBR is approximately:
+
+\begin{equation}
+\mathrm{CBR}(t) =
+\frac{
+T_{\mathrm{busy}}(t-W,t)
+}{
+W
+},
+\end{equation}
+
+where \(W=1\,\mathrm{s}\) is the CBR window.
+
+Therefore, in the current implementation:
+
+\begin{center}
+\textbf{CBR comes from PHY channel busy time, not directly from the sensing algorithm.}
+\end{center}
+
+\subsection{Sensing Exclusion Ratio}
+
+The sensing trace is used to compute \texttt{sensing\_exclusion\_ratio}:
+
+\begin{equation}
+\mathrm{ExclusionRatio} =
+\frac{
+N_{\mathrm{excluded}}
+}{
+N_{\mathrm{initial}}
+}.
+\end{equation}
+
+This metric describes how many candidate sidelink resources were excluded by the sensing-based resource selection algorithm.
+
+Thus:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Output & Source \\
+\midrule
+\texttt{cbr} & \texttt{NrSpectrumPhy::ChannelOccupied} \\
+\texttt{sensing\_exclusion\_ratio} & \texttt{NrSlUeMac::SensingAlgorithm} \\
+\texttt{prr\_awareness} & Packet TX/RX logs \\
+\texttt{pir\_s} & Packet RX timing logs \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{How the Simulation Starts}
+
+The simulation starts near the end of \texttt{main()}:
+
+\begin{lstlisting}[style=cppstyle]
+Simulator::Stop(Seconds(simTimeSeconds));
+Simulator::Run();
+Simulator::Destroy();
+\end{lstlisting}
+
+The meaning of these lines is:
+
+\begin{itemize}
+    \item \texttt{Simulator::Stop()} schedules the end time of the simulation.
+    \item \texttt{Simulator::Run()} starts processing ns-3 events.
+    \item \texttt{Simulator::Destroy()} cleans up after the simulation finishes.
+\end{itemize}
+
+The actual line that starts execution is:
+
+\begin{lstlisting}[style=cppstyle]
+Simulator::Run();
+\end{lstlisting}
+
+\section{How \texttt{Simulator::Run()} Executes Events}
+
+ns-3 is a discrete-event simulator. This means the program does not run as one continuous time loop. Instead, events are scheduled at specific simulation times. \texttt{Simulator::Run()} repeatedly takes the earliest event from the event queue and executes it.
+
+The event sequence is approximately as follows.
+
+\subsection{Before Simulation Time Starts}
+
+Before \texttt{Simulator::Run()}, the code schedules many future events:
+
+\begin{itemize}
+    \item sidelink bearer activation,
+    \item CAM application start times,
+    \item CBR sampling,
+    \item KPI sampling,
+    \item PRBS input updates,
+    \item simulation stop time.
+\end{itemize}
+
+\subsection{At Simulation Time 0}
+
+The simulator begins processing scheduled events. Vehicle mobility models are already installed, so each node position can be queried as a function of simulation time.
+
+\subsection{At 0.1 Seconds}
+
+CBR and KPI sampling begin. The functions reschedule themselves every \(0.1\,\mathrm{s}\).
+
+For KPI sampling:
+
+\begin{lstlisting}[style=cppstyle]
+Simulator::Schedule(
+    Seconds(sampleTimeS),
+    &KpiLogger::SampleAndWrite,
+    logger);
+\end{lstlisting}
+
+Inside \texttt{SampleAndWrite()}, another future sample is scheduled:
+
+\begin{lstlisting}[style=cppstyle]
+Simulator::Schedule(
+    Seconds(m_sampleTimeS),
+    &KpiLogger::SampleAndWrite,
+    this);
+\end{lstlisting}
+
+\subsection{At 2.0 Seconds}
+
+The sidelink bearer is activated:
+
+\begin{lstlisting}[style=cppstyle]
+nrSlHelper->ActivateNrSlBearer(
+    slBearersActivationTime,
+    allSlUesNetDeviceContainer,
+    tft);
+\end{lstlisting}
+
+\subsection{At Vehicle Application Start Time}
+
+Each CAM application starts at:
+
+\begin{equation}
+t_{\mathrm{app,start}} =
+\max(t_{\mathrm{bearer}} + t_{\mathrm{delay}}, t_{\mathrm{vehicle,active}}).
+\end{equation}
+
+In the code:
+
+\begin{lstlisting}[style=cppstyle]
+const double appStartS =
+    std::max((slBearersActivationTime + camApplicationStartDelay).GetSeconds(),
+             activeRange.first);
+\end{lstlisting}
+
+Usually this is approximately:
+
+\begin{equation}
+2.0\,\mathrm{s} + 0.2\,\mathrm{s} = 2.2\,\mathrm{s}.
+\end{equation}
+
+\subsection{When CAM Packets Are Generated}
+
+The CAM service generates messages. Each packet is tagged and logged, then sent through the NR sidelink stack.
+
+\subsection{Inside the NR Sidelink Stack}
+
+The NR stack internally schedules many events for:
+\begin{itemize}
+    \item resource selection,
+    \item sensing,
+    \item transmission,
+    \item propagation,
+    \item reception,
+    \item decoding,
+    \item callbacks.
+\end{itemize}
+
+These events are handled automatically by ns-3 after the scenario is configured.
+
+\subsection{When CAM Packets Are Received}
+
+When a receiver successfully receives a CAM packet, the receive callback logs the reception event. This is used later to compute PRR, PIR, and delay.
+
+\subsection{At PRBS Input Times}
+
+If \texttt{useInputSchedule=true}, each input row schedules an update:
+
+\begin{lstlisting}[style=cppstyle]
+Simulator::Schedule(
+    Seconds(u.timeS),
+    &ApplyInputsAtTime,
+    logger,
+    ueDevs,
+    u.txPowerDbm,
+    u.beaconIntervalS);
+\end{lstlisting}
+
+This updates:
+\begin{itemize}
+    \item transmit power for all UEs,
+    \item beacon interval for all CAM applications,
+    \item current input values stored in the KPI logger.
+\end{itemize}
+
+\subsection{At Simulation End Time}
+
+At \texttt{simTimeSeconds}, the simulation stops. Then \texttt{Simulator::Run()} returns and \texttt{Simulator::Destroy()} cleans up.
+
+\section{Computationally Expensive Parts}
+
+The most expensive parts of the simulation are likely the following.
+
+\subsection{NR Sidelink PHY and Channel Simulation}
+
+The NR-V2X PHY and channel model are likely the heaviest components. Each transmission may interact with many possible receivers. The simulator must evaluate propagation, interference, channel conditions, and decoding behavior.
+
+\subsection{Sidelink Sensing}
+
+Sidelink sensing is computationally expensive because UEs must evaluate candidate resources and sensing history. This also affects resource selection behavior.
+
+\subsection{Large Packet Volume}
+
+With 250 vehicles and a beacon interval of \(0.1\,\mathrm{s}\), the approximate number of transmissions over 600 seconds is:
+
+\begin{equation}
+250 \times 10 \times 600 = 1{,}500{,}000.
+\end{equation}
+
+This is a very large number of packet transmissions.
+
+\subsection{KPI Distance Calculations}
+
+For every transmitted packet, \texttt{LogTx()} scans all nodes to count eligible receivers. This is roughly:
+
+\begin{equation}
+1{,}500{,}000 \times 250
+=
+375{,}000{,}000
+\end{equation}
+
+distance checks.
+
+In addition, \texttt{ComputeTrafficContext()} calculates pairwise neighbor counts every \(0.1\,\mathrm{s}\). Over 600 seconds, this gives:
+
+\begin{equation}
+6000 \times 250 \times 250
+=
+375{,}000{,}000
+\end{equation}
+
+additional pairwise checks.
+
+Therefore, KPI computation itself can be expensive.
+
+\subsection{CSV Flushing}
+
+The code frequently calls \texttt{flush()} after writing rows to output files. For example:
+
+\begin{lstlisting}[style=cppstyle]
+m_out.flush();
+m_txOut.flush();
+m_rxOut.flush();
+\end{lstlisting}
+
+Frequent flushing can significantly increase disk I/O time, especially when packet-level TX and RX logs are large.
+
+\section{Addendum: Current Closed-Loop DeePC Code Flow}
+
+This section describes what changes when the newer closed-loop files are used instead of the original open-loop dataset-generation file.
+
+\subsection{Current Files}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+File & Purpose \\
+\midrule
+\texttt{nr\_v2x\_ngsim\_deepc\_data\_set\_generation.cc} & Generates open-loop training data using an input schedule. \\
+\texttt{nr\_v2x\_ngsim\_deepc\_closed\_loop\_deepc.cc} & Runs ns-3 with a DeePC controller in the loop. \\
+\texttt{deepc\_osqp\_file\_controller.py} & Reads ns-3 requests, solves DeePC using OSQP, and writes responses. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Main Flow Change}
+
+In the dataset-generation code, the input is open loop:
+
+\begin{lstlisting}[style=cppstyle]
+LoadInputScheduleCsv(inputCsv);
+ScheduleInputUpdates(logger, ueDevs);
+\end{lstlisting}
+
+In the closed-loop code, the PRBS schedule is not used. The C++ program requires:
+
+\begin{itemize}
+    \item \texttt{enableDeepcBridge=true},
+    \item \texttt{useInputSchedule=false},
+    \item \texttt{etsiCamGeneration=false},
+    \item \texttt{fixedBeaconInterval=0.1},
+    \item \texttt{sampleTime=0.5},
+    \item \texttt{deepcControlInterval=0.5},
+    \item \texttt{deepcPastHorizon=20},
+    \item \texttt{deepcFutureHorizon=10}.
+\end{itemize}
+
+Therefore, the closed-loop experiment keeps CAM generation fixed at 10 Hz and lets DeePC change only:
+
+\begin{equation}
+u(k) = P_{\mathrm{tx}}(k).
+\end{equation}
+
+The beacon interval is no longer a controlled input in the current closed-loop runner. It is fixed at:
+
+\begin{equation}
+T_b = 0.1\,\mathrm{s}.
+\end{equation}
+
+\subsection{Signals Sent to DeePC}
+
+The C++ bridge sends recent histories to the Python controller. The current signal layout is:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Role & Signals \\
+\midrule
+Input & \texttt{tx\_power\_dbm} \\
+Outputs & \texttt{prr\_awareness}, \texttt{pir\_s}, \texttt{cbr} \\
+Context & \texttt{active\_vehicle\_count\_core}, \texttt{beacon\_interval\_s} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The past horizon is 20 KPI samples. Since the sample time is \(0.5\,\mathrm{s}\), this gives 10 seconds of past history. The prediction horizon is 10 samples, or 5 seconds.
+
+\subsection{JSON Bridge Flow}
+
+The closed-loop code adds a file bridge called \texttt{DeepcFileBridge}. It writes request files such as:
+
+\begin{center}
+\texttt{bridge/requests/request\_000001.json}
+\end{center}
+
+Each request contains:
+
+\begin{itemize}
+    \item \texttt{u\_ini}: past transmit-power samples,
+    \item \texttt{y\_ini}: past PRR, PIR, and CBR samples,
+    \item \texttt{d\_ini}: past active-vehicle-count and beacon-interval samples,
+    \item \texttt{previous\_u}: the previously applied transmit power.
+\end{itemize}
+
+The Python controller writes the matching response file:
+
+\begin{center}
+\texttt{bridge/responses/response\_000001.json}
+\end{center}
+
+The response contains:
+
+\begin{itemize}
+    \item \texttt{success},
+    \item \texttt{solver\_status},
+    \item \texttt{tx\_power\_dbm},
+    \item predicted PRR, PIR, and CBR,
+    \item solve time,
+    \item equality-residual diagnostics.
+\end{itemize}
+
+If the response is valid and the transmit power is inside the allowed bounds, ns-3 applies it. Otherwise, ns-3 keeps the previous transmit power.
+
+\subsection{Closed-Loop Event Sequence}
+
+The event sequence is almost the same as the open-loop case until KPI sampling begins. The difference is what happens after warmup:
+
+\begin{enumerate}
+    \item \texttt{KpiLogger::SampleAndWrite()} creates a KPI sample every \(0.5\,\mathrm{s}\).
+    \item \texttt{RunDeepcBridgeStep()} reads the latest KPI sample.
+    \item The bridge stores the sample in a 20-sample history buffer.
+    \item When the history is full, ns-3 writes a request JSON file.
+    \item The Python OSQP controller solves the DeePC problem.
+    \item Python writes a response JSON file.
+    \item ns-3 reads the response and applies the returned transmit power.
+    \item The bridge schedules the next control step.
+\end{enumerate}
+
+The C++ function that applies the closed-loop command is:
+
+\begin{lstlisting}[style=cppstyle]
+ApplyTxPowerAtTime(logger, ueDevs, nextU.txPowerDbm, fixedBeaconIntervalS);
+\end{lstlisting}
+
+This is different from open-loop \texttt{ApplyInputsAtTime()}, because the closed-loop function changes transmit power while keeping the beacon interval fixed.
+
+\subsection{Python OSQP Controller}
+
+The Python controller loads the offline DeePC dataset:
+
+\begin{itemize}
+    \item \texttt{dataset\_summary.json},
+    \item \texttt{scaler.json},
+    \item \texttt{hankel\_train\_normalized.npz}.
+\end{itemize}
+
+It checks that the request matches the expected dataset contract:
+
+\begin{itemize}
+    \item one input column: \texttt{tx\_power\_dbm},
+    \item three output columns: \texttt{prr\_awareness}, \texttt{pir\_s}, \texttt{cbr},
+    \item two context columns: \texttt{active\_vehicle\_count\_core}, \texttt{beacon\_interval\_s},
+    \item \(T_{\mathrm{ini}}=20\),
+    \item \(N=10\).
+\end{itemize}
+
+The controller solves a quadratic program using CVXPY and OSQP. It optimizes the future transmit-power trajectory while satisfying the Hankel consistency constraints:
+
+\begin{align}
+U_p g &= u_{\mathrm{ini}}, \\
+Y_p g &= y_{\mathrm{ini}}, \\
+D_p g &= d_{\mathrm{ini}}, \\
+D_f g &= d_{\mathrm{future}}.
+\end{align}
+
+It also enforces:
+
+\begin{equation}
+10 \leq P_{\mathrm{tx}} \leq 23.
+\end{equation}
+
+Only the first optimized transmit-power value is sent back to ns-3. This is the usual receding-horizon control structure.
+
+\section{Summary}
+
+This code performs an open-loop NR-V2X simulation using NGSIM vehicle mobility. Vehicles transmit ETSI CAM messages over NR sidelink. The simulation varies transmit power and beacon interval according to a PRBS input schedule and records communication performance metrics.
+
+The main outputs are suitable for DeePC dataset generation. The most important output variables are PRR, PIR, CBR, sensing exclusion ratio, vehicle density, and neighbor counts.
+
+For the newer closed-loop runner, the same mobility, CAM, radio, and KPI ideas are reused. The main difference is that transmit power is selected online by the Python OSQP DeePC controller through the JSON bridge, while the CAM beacon interval stays fixed at \(0.1\,\mathrm{s}\).
+
+The most computationally expensive parts are:
+\begin{itemize}
+    \item NR sidelink PHY/channel simulation,
+    \item sidelink sensing and resource selection,
+    \item high CAM packet volume,
+    \item pairwise KPI distance calculations,
+    \item frequent CSV flushing.
+\end{itemize}
+
+The simulation is started by:
+
+\begin{lstlisting}[style=cppstyle]
+Simulator::Run();
+\end{lstlisting}
+
+This function executes all scheduled ns-3 events in chronological order until the stop time is reached.
+
+\end{document}

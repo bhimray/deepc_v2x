@@ -21,7 +21,6 @@
 #include "ns3/point-to-point-module.h"
 #include "ns3/tag.h"
 #include "ns3/vdp.h"
-
 #include "../src/cbr-logger.cc"
 
 #include <algorithm>
